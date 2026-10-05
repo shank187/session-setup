@@ -282,7 +282,7 @@ brave_ready()  { [ -x "$APPS/brave/brave" ]     && { [ -z "$OLD_BRAVE" ]  || [ -
 
 # downloaded .vsix files are only a cache, keep them off the home quota
 link_vsix_cache() {
-  mkdir -p "$GOINFRE/cache/vscode-vsix"
+  mkdir -p "$GOINFRE/cache/vscode-vsix" "$NEW_VSCODE"
   [ -L "$NEW_VSCODE/CachedExtensionVSIXs" ] || rm -rf "$NEW_VSCODE/CachedExtensionVSIXs"
   ln -sfn "$GOINFRE/cache/vscode-vsix" "$NEW_VSCODE/CachedExtensionVSIXs"
 }
