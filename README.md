@@ -1,20 +1,22 @@
 # session-setup
 
-Set up a 1337 / 42 workstation in one command: GPU-accelerated Brave and VS Code installed in goinfre, your data moved over from the flatpak versions, and your Docker project up and running.
+GPU-accelerated Brave and VS Code on 1337 / 42 workstations, set up in one command.
+
+session-setup installs the official Brave and VS Code builds in goinfre, moves your data over from the flatpak versions, and keeps everything working as you move from one workstation to another.
 
 ## Why
 
-The 1337 workstations run Ubuntu 22.04 with kernel 5.15. Brave and VS Code are installed as flatpaks, and the flatpak runtime ships Mesa 26, which needs kernel 6.6 or newer. On these machines it can't use the GPU, so it falls back to software rendering (llvmpipe) and everything those apps draw goes through the 4 CPU cores, the same cores your builds, Docker and dev servers need.
+The 1337 workstations run Ubuntu 22.04 with kernel 5.15. Brave and VS Code are installed as flatpaks, and the flatpak runtime ships Mesa 26, which needs kernel 6.6 or newer. On these machines it can't use the GPU, so it falls back to software rendering (llvmpipe) and everything those apps draw goes through the 4 CPU cores, the same cores your compiler, containers and dev servers need.
 
 In practice that means:
 
 - Animated or graphics-heavy pages stutter, and the browser competes with your work for CPU time
 - WebGL is turned off, so Figma (which requires WebGL), 3D viewers and other WebGL sites don't work
-- VS Code runs in a sandbox: its terminal has no `docker` or `node`, so everything goes through `host-spawn`
+- VS Code runs in a sandbox: its terminal can't see the tools installed on the system, so everything goes through `host-spawn`
 
 You can check it yourself: open `brave://gpu` in the flatpak Brave, the renderer is `llvmpipe`.
 
-The official Linux builds of Brave and VS Code use the system's own graphics drivers, which work with the GPU. They don't fit in the 10 GB home quota, so session-setup installs them in goinfre, moves your data over from the flatpak apps, and starts your project, in one command.
+The official Linux builds of Brave and VS Code use the system's own graphics drivers, which work with the GPU. They don't fit in the 10 GB home quota, so session-setup puts them in goinfre and keeps your data in your home.
 
 ### Before and after
 
@@ -28,7 +30,7 @@ Same test page in both browsers, on a 1337 workstation (Intel i5-7500, AMD Radeo
 | CPU usage during that test | 34% | 32% |
 | Scrolling a long page | 60 fps | 60 fps |
 
-Ten times the frame rate for the same CPU usage (60 fps is the screen's limit). Plain scrolling was already smooth; the difference shows on anything animated or graphics-heavy, like design tools, 3D viewers and animated dashboards. With rendering on the GPU, the CPU stays free for your builds and containers.
+Ten times the frame rate for the same CPU usage (60 fps is the screen's limit). Plain scrolling was already smooth; the difference shows on anything animated or graphics-heavy, like design tools, 3D viewers and animated dashboards. With rendering on the GPU, the CPU stays free for your work.
 
 ### Setup time
 
@@ -37,16 +39,16 @@ Ten times the frame rate for the same CPU usage (60 fps is the screen's limit). 
 | First run on a workstation (downloads Brave and VS Code) | about 35 seconds |
 | Every run after that on the same workstation | about 2 seconds |
 
-Copying your data from the flatpak apps happens once, on your first run. On a new workstation, building your project's Docker images comes on top of this and depends on the project.
+Your data is copied from the flatpak apps once, on your very first run.
 
 ## Features
 
 - Installs the latest Brave and VS Code in goinfre, verifies their checksums and keeps them up to date
 - Copies your flatpak Brave and VS Code data once: logins, saved passwords, bookmarks, open tabs, extensions, settings, history
-- Starts rootless Docker and your project's `docker compose` stack
-- Opens VS Code on your project and Brave on your frontend
-- Adds `code` and `brave` commands and app menu entries, which set the apps up by themselves on a new workstation
-- Finds everything at runtime (goinfre, your project, the flatpak data, Node), so the same script works for anyone, on any workstation
+- Keeps the large app files out of your home quota, and your data in your home where it follows you
+- Adds `brave` and `code` commands and app menu entries, which install the apps by themselves on a workstation that doesn't have them yet
+- Runs VS Code outside the flatpak sandbox, with a regular terminal and your nvm Node on the PATH
+- Detects everything at runtime, so the same script works for anyone, on any workstation
 
 ## Installation
 
@@ -67,51 +69,69 @@ Run it at the start of every session:
 session-setup
 ```
 
-On a workstation you haven't used before, it downloads Brave and VS Code (about a minute). On one you have, it only checks for updates.
+It makes sure Brave and VS Code are installed and up to date on the workstation you're on, then opens them.
 
-After that, use "Brave (native)" and "VS Code (native)" from the app menu, or the `brave` and `code` commands. Pin them to the dock in place of the old flatpak entries.
+Day to day, use "Brave (native)" and "VS Code (native)" from the app menu, or the `brave` and `code` commands. Pin them to the dock in place of the old flatpak entries.
 
 ### Options
 
 | Command | What it does |
 |---|---|
-| `session-setup` | Full setup: install, copy data, start Docker, open the apps |
-| `session-setup --prepare` | Install and copy data only |
-| `session-setup --no-docker` | Full setup without Docker |
-| `session-setup --project DIR` | Use `DIR` as the project (remembered for next time) |
-| `session-setup --reimport [vscode\|brave]` | Copy the flatpak data again (the current data is backed up first) |
+| `session-setup` | Install or update the apps, copy your data if needed, open both apps |
+| `session-setup --prepare` | Same, without opening the apps |
+| `session-setup --reimport [vscode\|brave]` | Copy the flatpak data again (your current data is backed up first) |
+| `session-setup open vscode\|brave [args]` | Start one app, installing it first if needed (this is what `code`, `brave` and the app menu entries run) |
 
 ## How it works
 
 ### Storage
 
-| Location | Contents | Lifetime |
-|---|---|---|
-| Home (`~`) | The script, your profiles and settings | Follows you to every workstation |
-| goinfre (`/goinfre/$USER`) | Brave and VS Code, Docker data, backups | Stays on that workstation |
+42 workstations give you two places to keep files:
 
-Because Docker data lives in goinfre, your local database starts empty on a new workstation. Keep the data you need in migrations or seeds.
+| | Home (`~`) | goinfre (`/goinfre/$USER`) |
+|---|---|---|
+| Size | 10 GB quota | Hundreds of GB |
+| Where it's available | On every workstation you log into | Only on the workstation it's on |
+| How long it lasts | Permanent | Can be cleaned at any time |
+| What session-setup keeps there | The script, your Brave profile, your VS Code settings and state | Brave and VS Code themselves, downloaded extension packages, backups |
+
+The apps are large (about 1.5 GB together) and can be downloaded again at any time, so they live in goinfre. Your data is what matters and has to follow you, so it stays in your home. Home is also the better place for it performance-wise: goinfre is a local hard drive, and it's noticeably slower than home at the many small writes a browser profile makes.
+
+When you log into a workstation whose goinfre doesn't have the apps (a workstation you haven't used, or one whose goinfre was cleaned), the next `session-setup` run, or a click on one of the app entries, downloads them again. Nothing is lost, because your data was never in goinfre.
+
+Exact locations:
+
+| What | Where |
+|---|---|
+| Brave profile | `~/.config/BraveSoftware/Brave-Browser` |
+| Brave cache (limited to 500 MB) | `~/.cache/BraveSoftware` |
+| VS Code settings and state | `~/.config/Code` |
+| VS Code extensions | Shared with the flatpak VS Code in `~/.var/app/com.visualstudio.code/data/vscode/extensions`, or `~/.vscode/extensions` if you never used the flatpak |
+| Brave and VS Code | `/goinfre/$USER/apps` |
+| Backups made by `--reimport` | `/goinfre/$USER/backups` |
 
 ### Data migration
 
 - Done once per app, caches excluded. The flatpak data is never modified, so you can always go back.
 - VS Code extensions are shared with the flatpak VS Code rather than copied, to save space.
-- If you already have native Brave or VS Code data in `~/.config`, it is kept. `--reimport` replaces it and moves the previous data to `goinfre/backups`.
+- If you already have native Brave or VS Code data in `~/.config`, it is kept. `--reimport` replaces it and moves the previous data to goinfre.
 - Configs that tools created from inside the flatpak terminal (git's global ignore file, for example) are copied to `~/.config` when you don't have them already.
 
-### Project detection
+### Detected at runtime
 
-In order: the `--project` option, the git repository you're in (if it has a compose file), the last project used, and finally the most recently used git repository in your home that has a compose file. The page Brave opens is the published port of the frontend/web service in that compose file.
+- goinfre: `/goinfre/$USER`, or `$GOINFRE` if you set it. Without a goinfre, the apps go to `~/.local/opt` and you get a warning, since that takes about 1.5 GB of your home.
+- The flatpak (or snap) Brave and VS Code data, wherever it is in `~/.var/app`.
+- The VS Code extensions folder in use.
+- Node from nvm, wherever nvm is installed, so VS Code terminals don't fall back to the old system Node.
 
 ### Also
 
 - Stops `gnome-software`, which uses around 300 MB of RAM in the background (it comes back at next login)
 - Limits Brave's disk cache to 500 MB
-- Reuses the Node version from nvm, so VS Code terminals don't fall back to the old system Node
 
 ## Requirements
 
-A 1337 / 42 Linux workstation. Everything the script uses (bash, curl, unzip, tar, rsync, python3, flatpak) is already installed. Docker is optional.
+A 1337 / 42 Linux workstation. Everything the script uses (bash, curl, unzip, tar, rsync, python3, flatpak) is already installed.
 
 ## Uninstall
 
