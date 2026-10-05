@@ -122,7 +122,7 @@ find_vscode_extensions() {
 find_node_bin() {
   local d def bin
   for d in "${NVM_DIR:-}" "$HOME/.nvm" "$HOME"/.var/app/*/config/nvm; do
-    [ -n "$d" ] && [ -d "$d/versions/node" ] || continue
+    if [ -z "$d" ] || [ ! -d "$d/versions/node" ]; then continue; fi
     def=$(cat "$d/alias/default" 2>/dev/null || true)
     bin=$(latest_bin "$d/versions/node/v${def#v}"*/bin || true)
     [ -n "$bin" ] || bin=$(latest_bin "$d"/versions/node/*/bin || true)
@@ -285,10 +285,10 @@ write_launchers() {
 
   # the flatpak's icon if there is one, else the app's own
   icon_vscode=$(app_root "$OLD_VSCODE"); icon_brave=$(app_root "$OLD_BRAVE")
-  [[ $icon_vscode == "$HOME/.var/app/"* ]] && icon_vscode=$(basename "$icon_vscode") \
-    || icon_vscode="$APPS/vscode/resources/app/resources/linux/code.png"
-  [[ $icon_brave == "$HOME/.var/app/"* ]] && icon_brave=$(basename "$icon_brave") \
-    || icon_brave="$APPS/brave/product_logo_256.png"
+  if [[ $icon_vscode == "$HOME/.var/app/"* ]]; then icon_vscode=$(basename "$icon_vscode")
+  else icon_vscode="$APPS/vscode/resources/app/resources/linux/code.png"; fi
+  if [[ $icon_brave == "$HOME/.var/app/"* ]]; then icon_brave=$(basename "$icon_brave")
+  else icon_brave="$APPS/brave/product_logo_256.png"; fi
 
   mkdir -p "$DATA_DIR/applications"
   cat > "$DATA_DIR/applications/code-native.desktop" <<EOF
