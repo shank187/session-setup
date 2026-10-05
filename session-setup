@@ -10,6 +10,7 @@
 
 set -euo pipefail
 
+VERSION=1.0.0
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # Inside a flatpak (e.g. the VS Code flatpak terminal): run on the host instead.
@@ -59,6 +60,7 @@ usage: session-setup [options]
                              is moved to <goinfre>/backups first
   open vscode|brave [ARGS]   start the native app (what `code`, `brave` and the
                              app grid entries run)
+  --version                  print the version
 EOF
 }
 
@@ -86,7 +88,10 @@ find_goinfre() {
 }
 
 # most recently modified of the given paths, or nothing
-newest() { ls -dt "$@" 2>/dev/null | head -n1 || true; }
+newest() { find "$@" -maxdepth 0 -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2- || true; }
+
+# highest version among the given node bin folders (glob results), or nothing
+latest_bin() { [ -d "$1" ] && printf '%s\n' "$@" | sort -V | tail -n1; }
 
 # ~/.var/app/<id> or ~/snap/<name>/current, for data that belongs to a flatpak/snap
 app_root() {
@@ -119,8 +124,8 @@ find_node_bin() {
   for d in "${NVM_DIR:-}" "$HOME/.nvm" "$HOME"/.var/app/*/config/nvm; do
     [ -n "$d" ] && [ -d "$d/versions/node" ] || continue
     def=$(cat "$d/alias/default" 2>/dev/null || true)
-    bin=$(ls -d "$d/versions/node/v${def#v}"*/bin 2>/dev/null | sort -V | tail -n1 || true)
-    [ -n "$bin" ] || bin=$(ls -d "$d"/versions/node/*/bin 2>/dev/null | sort -V | tail -n1 || true)
+    bin=$(latest_bin "$d/versions/node/v${def#v}"*/bin || true)
+    [ -n "$bin" ] || bin=$(latest_bin "$d"/versions/node/*/bin || true)
     [ -n "$bin" ] && { echo "$bin"; return 0; }
   done
 }
@@ -153,7 +158,9 @@ ensure_app() {
          esac; }; then
     rm -rf "$tmp"; warn "$(label "$name"): download failed or checksum didn't match"; return 1
   fi
-  echo "$latest" > "$tmp/x/$subdir/.installed-version"
+  if ! { [ -d "$tmp/x/$subdir" ] && echo "$latest" > "$tmp/x/$subdir/.installed-version"; }; then
+    rm -rf "$tmp"; warn "$(label "$name"): the download doesn't look like it used to, keeping the current version"; return 1
+  fi
   rm -rf "$dest" && mv "$tmp/x/$subdir" "$dest" && rm -rf "$tmp"
 }
 
@@ -208,9 +215,11 @@ import_data() {
   fi
   log "Copying your $(label "$name") data from $(pretty "$old")"
   mkdir -p "$(dirname "$new")"
-  rsync -a "${CACHE_EXCLUDES[@]}" "$old/" "$new.partial/" &&
-    printf 'from=%s\ndate=%s\n' "$old" "$(date -Is)" > "$new.partial/$MARKER" &&
-    mv "$new.partial" "$new" || { warn "Copying the $(label "$name") data failed"; return 1; }
+  if ! { rsync -a "${CACHE_EXCLUDES[@]}" "$old/" "$new.partial/" &&
+         printf 'from=%s\ndate=%s\n' "$old" "$(date -Is)" > "$new.partial/$MARKER" &&
+         mv "$new.partial" "$new"; }; then
+    warn "Copying the $(label "$name") data failed"; return 1
+  fi
   root=$(app_root "$old")
   [ -z "$root" ] || carry_tool_configs "$root"
 }
@@ -268,9 +277,11 @@ write_wrapper() {
 }
 
 write_launchers() {
-  local icon_vscode icon_brave rc
+  local icon_vscode icon_brave rc exec=$SELF
   write_wrapper code vscode
   write_wrapper brave brave
+  # quote only when needed: xdg-settings can't read a quoted Exec path
+  [[ $exec == *[[:space:]]* ]] && exec="\"$exec\""
 
   # the flatpak's icon if there is one, else the app's own
   icon_vscode=$(app_root "$OLD_VSCODE"); icon_brave=$(app_root "$OLD_BRAVE")
@@ -285,7 +296,7 @@ write_launchers() {
 Type=Application
 Name=VS Code (native)
 Comment=VS Code from goinfre, using the GPU
-Exec="$SELF" open vscode %F
+Exec=$exec open vscode %F
 Icon=$icon_vscode
 Categories=Development;IDE;
 StartupWMClass=code
@@ -295,7 +306,7 @@ EOF
 Type=Application
 Name=Brave (native)
 Comment=Brave from goinfre, using the GPU
-Exec="$SELF" open brave %U
+Exec=$exec open brave %U
 Icon=$icon_brave
 Categories=Network;WebBrowser;
 MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
@@ -308,9 +319,24 @@ EOF
     *)    return 0 ;;
   esac
   if ! grep -qs '# Added by session-setup' "$rc"; then
+    # shellcheck disable=SC2016  # $PATH has to stay literal in the rc file
     printf '\n# Added by session-setup: personal commands (code, brave, session-setup)\nexport PATH="%s:$PATH"\n' \
       "${INSTALL_DIR/#$HOME/\$HOME}" >> "$rc"
     log "Added $(pretty "$INSTALL_DIR") to your PATH in $(pretty "$rc"), open a new terminal to use it"
+  fi
+}
+
+# Links clicked in other apps should open the new Brave, not the flatpak one with
+# the old profile. Only done when the flatpak Brave is the default browser.
+claim_default_browser() {
+  local old_id current
+  old_id=$(app_root "$OLD_BRAVE")
+  [[ $old_id == "$HOME/.var/app/"* ]] || return 0
+  old_id="$(basename "$old_id").desktop"
+  current=$(xdg-settings get default-web-browser 2>/dev/null || true)
+  [ "$current" = "$old_id" ] || return 0
+  if xdg-settings set default-web-browser brave-native.desktop 2>/dev/null; then
+    log "Links from other apps now open the new Brave instead of the flatpak one"
   fi
 }
 
@@ -328,12 +354,15 @@ prepare() {
   import_data brave  "$OLD_BRAVE"  "$NEW_BRAVE"  || failed=1
   if vscode_ready; then link_vsix_cache; fi
   write_launchers
+  if brave_ready; then claim_default_browser; fi
   return $failed
 }
 
 free_ram() {
-  # sits on ~300 MB doing nothing, GNOME starts it again at next login
-  if pkill -x gnome-software; then log "Stopped gnome-software (~300 MB of RAM back)"; fi
+  # the software center's background updater, ~300 MB; GNOME starts it again at next login
+  if pkill -f 'gnome-software --gapplication-service'; then
+    log "Stopped the gnome-software background service (~300 MB of RAM back)"
+  fi
 }
 
 launch_apps() {
@@ -359,12 +388,15 @@ open_app() {
   local name=$1; shift
   if ! "${name}_ready"; then
     notify "Getting $(label "$name") ready on this post, takes about a minute..."
-    prepare >"$STATE_DIR/last-run.log" 2>&1 || true
+    # wait for a run that may already be setting things up, then check again
+    flock -w 600 9 || { notify "session-setup is busy, try again in a minute"; exit 1; }
+    "${name}_ready" || prepare >"$STATE_DIR/last-run.log" 2>&1 || true
     if ! "${name}_ready"; then
       notify "$(label "$name") isn't ready: $(grep -h '^!!' "$STATE_DIR/last-run.log" | tail -n1 | cut -c5-)"
       exit 1
     fi
   fi
+  exec 9>&-   # don't hand the lock to the app
   case "$name" in
     vscode)
       local node_bin; node_bin=$(find_node_bin)
@@ -395,6 +427,7 @@ main() {
         esac
         mode=open; shift 2; break ;;
       -h|--help) usage; exit 0 ;;
+      --version) echo "session-setup $VERSION"; exit 0 ;;
       *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
     shift
@@ -406,10 +439,17 @@ main() {
   OLD_BRAVE=$(newest "$HOME"/.var/app/*/config/BraveSoftware/Brave-Browser \
                      "$HOME"/snap/brave/current/.config/BraveSoftware/Brave-Browser)
   VSCODE_EXTENSIONS=$(find_vscode_extensions)
-  mkdir -p "$APPS" "$STATE_DIR"
+  if ! mkdir -p "$APPS" 2>/dev/null; then
+    echo "Can't write to $GOINFRE. Set GOINFRE to a folder you own, e.g. GOINFRE=/goinfre/$USER session-setup" >&2
+    exit 1
+  fi
   chmod 700 "$GOINFRE" 2>/dev/null || true
+  mkdir -p "$STATE_DIR"
 
+  # one run at a time (a terminal run and a click on an app entry, for example)
+  exec 9>"$STATE_DIR/lock"
   if [ "$mode" = open ]; then open_app "$OPEN_APP" "$@"; fi
+  if ! flock -n 9; then echo "session-setup is already running" >&2; exit 1; fi
 
   log "goinfre:            $GOINFRE"
   log "flatpak VS Code:    $(pretty "${OLD_VSCODE:-not found}")"
