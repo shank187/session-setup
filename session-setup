@@ -10,13 +10,14 @@
 
 set -euo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
-# Inside a flatpak (e.g. the VS Code flatpak terminal): run on the host instead.
+# Inside a flatpak (e.g. the VS Code flatpak terminal): run on the host instead,
+# remembering which app we came from so we never close the terminal we run in.
 if [ -f /.flatpak-info ] && [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  if command -v host-spawn >/dev/null; then exec host-spawn "$SELF" "$@"; fi
-  exec flatpak-spawn --host "$SELF" "$@"
+  if command -v host-spawn >/dev/null; then exec host-spawn "$SELF" --from-flatpak "${FLATPAK_ID:-}" "$@"; fi
+  exec flatpak-spawn --host "$SELF" --from-flatpak "${FLATPAK_ID:-}" "$@"
 fi
 
 USER=${USER:-$(id -un)}
@@ -56,6 +57,8 @@ usage: session-setup [options]
   (no options)               install/update Brave and VS Code, copy your data from
                              the flatpak apps (first run only), open both
   --prepare                  only install/update and copy data
+  --close-old                close the flatpak Brave and VS Code first (they can
+                             keep running in the background after you close them)
   --reimport [vscode|brave]  copy the flatpak data again; the current native data
                              is moved to <goinfre>/backups first
   open vscode|brave [ARGS]   start the native app (what `code`, `brave` and the
@@ -102,13 +105,65 @@ app_root() {
   esac
 }
 
-old_app_running() {
-  local root; root=$(app_root "$1")
+# Main process(es) of the old app; empty once it has quit, even when helpers it
+# leaves behind (crash reporter, settings monitor) keep its flatpak sandbox alive.
+old_app_pids() {
+  local root roots; root=$(app_root "$1")
   case "$root" in
-    "$HOME"/.var/app/*) flatpak ps --columns=application 2>/dev/null | grep -qxF "$(basename "$root")" ;;
-    "$HOME"/snap/*)     pgrep -f "/snap/$(basename "$(dirname "$root")")/" >/dev/null ;;
-    *) return 1 ;;
+    "$HOME"/.var/app/*)
+      roots=$(flatpak ps --columns=child-pid,application 2>/dev/null |
+              awk -v id="$(basename "$root")" '$2 == id {printf "%s ", $1}')
+      [ -n "$roots" ] || return 0
+      # processes directly inside a sandbox, minus sandboxes, helpers and --type= children
+      ps -eo pid=,ppid=,args= | awk -v roots="$roots" '
+        BEGIN { n = split(roots, r, " "); for (i = 1; i <= n; i++) root[r[i]] = 1 }
+        root[$2] && $3 !~ /(^|\/)(bwrap|cat|gsettings)$/ && $3 !~ /crashpad_handler/ && $0 !~ /--type=/ { print $1 }' ;;
+    "$HOME"/snap/*)
+      pgrep -f "/snap/$(basename "$(dirname "$root")")/" || true ;;
   esac
+}
+
+old_app_running() { [ -n "$(old_app_pids "$1")" ]; }
+
+# close_old_app NAME OLD
+# Asks the old app's main process to quit, so it closes its windows and saves its
+# session (signalling its helpers first makes it show crash dialogs instead).
+# Forces it after 15 s, then clears whatever it left behind in its sandbox.
+close_old_app() {
+  local name=$1 old=$2 root id="" snap="" p
+  old_app_running "$old" || return 0
+  root=$(app_root "$old")
+  case "$root" in
+    "$HOME"/.var/app/*) id=$(basename "$root") ;;
+    "$HOME"/snap/*)     snap=$(basename "$(dirname "$root")") ;;
+  esac
+  if [ -n "$id" ] && [ "$id" = "$FROM_FLATPAK" ]; then
+    warn "This is running in the flatpak $(label "$name")'s own terminal, which would close too." \
+         "Run it from a regular terminal (Ctrl+Alt+T) instead"
+    return 1
+  fi
+  log "Closing the flatpak $(label "$name")"
+  for p in $(old_app_pids "$old"); do kill -TERM "$p" 2>/dev/null || true; done
+  for _ in $(seq 1 15); do old_app_running "$old" || break; sleep 1; done
+  if [ -n "$id" ]; then
+    flatpak kill "$id" 2>/dev/null || true
+  elif old_app_running "$old"; then
+    pkill -KILL -f "/snap/$snap/" 2>/dev/null || true
+  fi
+  sleep 1
+  if old_app_running "$old"; then warn "Couldn't close the flatpak $(label "$name")"; return 1; fi
+}
+
+# The old app is running while its data needs copying: close it if --close-old
+# was given or the user says yes. Never asks when started from an app entry.
+offer_close_old() {
+  local name=$1 old=$2 answer
+  if [ "$CLOSE_OLD" != 1 ]; then
+    if [ "$MODE" = open ] || [ ! -t 0 ]; then return 1; fi
+    read -r -p "The flatpak $(label "$name") is still running (maybe in the background). Close it now? [Y/n] " answer || return 1
+    case "$answer" in ""|[Yy]*) ;; *) return 1 ;; esac
+  fi
+  close_old_app "$name" "$old"
 }
 
 find_vscode_extensions() {
@@ -203,8 +258,9 @@ import_data() {
       return 0
     fi
   fi
-  if old_app_running "$old"; then
-    warn "The flatpak $(label "$name") is still open, quit it ($(quit_hint "$name")) and run again so your data can be copied"
+  if old_app_running "$old" && ! offer_close_old "$name" "$old"; then
+    warn "The flatpak $(label "$name") is still running (it can keep running in the background after you close" \
+         "its window). Quit it ($(quit_hint "$name")) or run: session-setup --close-old"
     return 1
   fi
   if pgrep -f "$APPS/$name/" >/dev/null; then warn "Close the native $(label "$name") and run again"; return 1; fi
@@ -377,7 +433,8 @@ launch_apps() {
   fi
   for old in "$OLD_VSCODE" "$OLD_BRAVE"; do
     if [ -n "$old" ] && old_app_running "$old"; then
-      warn "$(basename "$(app_root "$old")") (flatpak) is still open, it renders on the CPU so better close it"
+      warn "$(basename "$(app_root "$old")") (flatpak) is still running and renders on the CPU." \
+           "session-setup --close-old closes it"
     fi
   done
 }
@@ -408,11 +465,12 @@ open_app() {
 }
 
 main() {
-  local mode=full
-  REIMPORT=""
+  MODE=full REIMPORT="" CLOSE_OLD=0 FROM_FLATPAK=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --prepare) mode=prepare ;;
+      --prepare)      MODE=prepare ;;
+      --close-old)    CLOSE_OLD=1 ;;
+      --from-flatpak) FROM_FLATPAK=${2:-}; shift ;;
       --reimport)
         case "${2:-}" in
           vscode|code) REIMPORT=vscode; shift ;;
@@ -425,7 +483,7 @@ main() {
           brave)       OPEN_APP=brave ;;
           *) echo "usage: session-setup open vscode|brave [ARGS]" >&2; exit 2 ;;
         esac
-        mode=open; shift 2; break ;;
+        MODE=open; shift 2; break ;;
       -h|--help) usage; exit 0 ;;
       --version) echo "session-setup $VERSION"; exit 0 ;;
       *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -448,7 +506,7 @@ main() {
 
   # one run at a time (a terminal run and a click on an app entry, for example)
   exec 9>"$STATE_DIR/lock"
-  if [ "$mode" = open ]; then open_app "$OPEN_APP" "$@"; fi
+  if [ "$MODE" = open ]; then open_app "$OPEN_APP" "$@"; fi
   if ! flock -n 9; then echo "session-setup is already running" >&2; exit 1; fi
 
   log "goinfre:            $GOINFRE"
@@ -456,8 +514,12 @@ main() {
   log "VS Code extensions: $(pretty "$VSCODE_EXTENSIONS")"
   log "flatpak Brave:      $(pretty "${OLD_BRAVE:-not found}")"
 
+  if [ "$CLOSE_OLD" = 1 ]; then
+    [ -z "$OLD_VSCODE" ] || close_old_app vscode "$OLD_VSCODE" || FAILED=1
+    [ -z "$OLD_BRAVE" ]  || close_old_app brave "$OLD_BRAVE" || FAILED=1
+  fi
   prepare || FAILED=1
-  if [ "$mode" = full ]; then
+  if [ "$MODE" = full ]; then
     free_ram
     launch_apps
   fi
