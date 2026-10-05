@@ -2,13 +2,42 @@
 
 Set up a 1337 / 42 workstation in one command: GPU-accelerated Brave and VS Code installed in goinfre, your data moved over from the flatpak versions, and your Docker project up and running.
 
-## The problem
+## Why
 
-On the 1337 workstations (Ubuntu 22.04, kernel 5.15), flatpak apps can't use the GPU. The current flatpak runtime ships Mesa 26, which needs kernel 6.6 or newer, so it falls back to software rendering (llvmpipe). Brave, VS Code and every other flatpak app end up drawing everything on the CPU, which is why they feel slow.
+The 1337 workstations run Ubuntu 22.04 with kernel 5.15. Brave and VS Code are installed as flatpaks, and the flatpak runtime ships Mesa 26, which needs kernel 6.6 or newer. On these machines it can't use the GPU, so it falls back to software rendering (llvmpipe) and everything those apps draw goes through the 4 CPU cores, the same cores your builds, Docker and dev servers need.
 
-You can check it yourself: open `brave://gpu` in the flatpak Brave and look at the renderer, it says `llvmpipe`.
+In practice that means:
 
-The official Linux builds of Brave and VS Code use the system graphics drivers and get full GPU acceleration. They don't fit in the 10 GB home quota, so session-setup installs them in goinfre and keeps your profiles in your home.
+- Animated or graphics-heavy pages stutter, and the browser competes with your work for CPU time
+- WebGL is turned off, so Figma (which requires WebGL), 3D viewers and other WebGL sites don't work
+- VS Code runs in a sandbox: its terminal has no `docker` or `node`, so everything goes through `host-spawn`
+
+You can check it yourself: open `brave://gpu` in the flatpak Brave, the renderer is `llvmpipe`.
+
+The official Linux builds of Brave and VS Code use the system's own graphics drivers, which work with the GPU. They don't fit in the 10 GB home quota, so session-setup installs them in goinfre, moves your data over from the flatpak apps, and starts your project, in one command.
+
+### Before and after
+
+Same test page in both browsers, on a 1337 workstation (Intel i5-7500, AMD Radeon RX 470/580, 8 GB RAM):
+
+| | Flatpak Brave | Brave from session-setup |
+|---|---|---|
+| Renderer | llvmpipe (CPU) | AMD Radeon (GPU) |
+| WebGL, needed by Figma | Not available | Available |
+| Page with 400 animated elements | 6 fps | 60 fps |
+| CPU usage during that test | 34% | 32% |
+| Scrolling a long page | 60 fps | 60 fps |
+
+Ten times the frame rate for the same CPU usage (60 fps is the screen's limit). Plain scrolling was already smooth; the difference shows on anything animated or graphics-heavy, like design tools, 3D viewers and animated dashboards. With rendering on the GPU, the CPU stays free for your builds and containers.
+
+### Setup time
+
+| | Time |
+|---|---|
+| First run on a workstation (downloads Brave and VS Code) | about 35 seconds |
+| Every run after that on the same workstation | about 2 seconds |
+
+Copying your data from the flatpak apps happens once, on your first run. On a new workstation, building your project's Docker images comes on top of this and depends on the project.
 
 ## Features
 
