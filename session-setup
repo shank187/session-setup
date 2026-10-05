@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+#
+# session-setup: get a 1337/42 post ready to work on.
+#
+# Installs the official Brave and VS Code builds in goinfre (the flatpak ones
+# can't use the GPU on these machines), copies your data over from the flatpak
+# apps once, starts docker + your project and opens everything.
+#
+# session-setup --help for the options, README.md for the details.
+
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# Inside a flatpak (e.g. the VS Code flatpak terminal): run on the host instead.
+if [ -f /.flatpak-info ] && [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if command -v host-spawn >/dev/null; then exec host-spawn "$SELF" "$@"; fi
+  exec flatpak-spawn --host "$SELF" "$@"
+fi
+
+USER=${USER:-$(id -un)}
+CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}
+DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}
+INSTALL_DIR="$HOME/.local/bin"
+STATE_DIR="$CONF_DIR/session-setup"
+
+VSCODE_API="https://update.code.visualstudio.com/api/update/linux-x64/stable/latest"
+BRAVE_VERSION_URL="https://versions.brave.com/latest/release-linux-x64.version"
+BRAVE_CACHE_BYTES=524288000   # 500 MB
+# Without its own window class the dock shows native Brave as the flatpak one.
+# VS Code ignores --class, but its "code" already differs from the flatpak's "Code".
+BRAVE_WM_CLASS=brave-native
+
+# Default data folders of the native apps
+NEW_VSCODE="$CONF_DIR/Code"
+NEW_BRAVE="$CONF_DIR/BraveSoftware/Brave-Browser"
+MARKER=".session-setup-import"
+
+# Left out when copying profiles, all of it gets rebuilt
+CACHE_EXCLUDES=(
+  --exclude='Singleton*' --exclude='*.lock' --exclude='*.sock' --exclude='.org.chromium.*'
+  --exclude='Cache' --exclude='CachedData' --exclude='CachedProfilesData' --exclude='CachedExtensionVSIXs'
+  --exclude='Code Cache' --exclude='GPUCache' --exclude='GPUPersistentCache' --exclude='GrShaderCache'
+  --exclude='GraphiteDawnCache' --exclude='ShaderCache' --exclude='DawnGraphiteCache'
+  --exclude='DawnWebGPUCache' --exclude='CacheStorage' --exclude='sdk-cache' --exclude='Crash Reports'
+  --exclude='Crashpad' --exclude='logs' --exclude='component_crx_cache' --exclude='extensions_crx_cache'
+  --exclude="$MARKER"
+)
+FAILED=0
+
+usage() {
+  cat <<'EOF'
+usage: session-setup [options]
+
+  (no options)               install/update Brave and VS Code, copy your data from
+                             the flatpak apps (first run only), start docker and
+                             your project, open everything
+  --prepare                  only install/update and copy data
+  --no-docker                everything except docker
+  --project DIR              use DIR as the project (remembered for next time)
+  --reimport [vscode|brave]  copy the flatpak data again; the current native data
+                             is moved to <goinfre>/backups first
+  open vscode|brave [ARGS]   start the native app (what `code`, `brave` and the
+                             app grid entries run)
+EOF
+}
+
+if [ -t 1 ]; then
+  log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+  warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
+else
+  log()  { printf '==> %s\n' "$*"; }
+  warn() { printf '!!  %s\n' "$*" >&2; }
+fi
+notify()    { notify-send "session-setup" "$*" 2>/dev/null || true; }
+json_get()  { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+pretty()    { echo "${1/#$HOME/\~}"; }
+label()     { case "$1" in vscode) echo "VS Code" ;; brave) echo "Brave" ;; *) echo "$1" ;; esac; }
+quit_hint() { case "$1" in vscode) echo "File > Exit" ;; brave) echo "Ctrl+Shift+Q" ;; esac; }
+
+# --- finding things --------------------------------------------------------------
+
+find_goinfre() {
+  if [ -n "${GOINFRE:-}" ]; then echo "$GOINFRE"
+  elif [ -d /goinfre ]; then echo "/goinfre/$USER"
+  elif [ -d "$HOME/goinfre" ]; then readlink -f "$HOME/goinfre"
+  else echo "$HOME/.local/opt"
+  fi
+}
+
+# most recently modified of the given paths, or nothing
+newest() { ls -dt "$@" 2>/dev/null | head -n1 || true; }
+
+# ~/.var/app/<id> or ~/snap/<name>/current, for data that belongs to a flatpak/snap
+app_root() {
+  local rest
+  case "$1" in
+    "$HOME"/.var/app/*) rest=${1#"$HOME"/.var/app/}; echo "$HOME/.var/app/${rest%%/*}" ;;
+    "$HOME"/snap/*)     rest=${1#"$HOME"/snap/};     echo "$HOME/snap/${rest%%/*}/current" ;;
+  esac
+}
+
+old_app_running() {
+  local root; root=$(app_root "$1")
+  case "$root" in
+    "$HOME"/.var/app/*) flatpak ps --columns=application 2>/dev/null | grep -qxF "$(basename "$root")" ;;
+    "$HOME"/snap/*)     pgrep -f "/snap/$(basename "$(dirname "$root")")/" >/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+find_vscode_extensions() {
+  local root; root=$(app_root "$OLD_VSCODE")
+  if [ -n "$root" ] && [ -d "$root/data/vscode/extensions" ]; then echo "$root/data/vscode/extensions"
+  else echo "$HOME/.vscode/extensions"
+  fi
+}
+
+# node from nvm wherever it is, preferring nvm's default version
+find_node_bin() {
+  local d def bin
+  for d in "${NVM_DIR:-}" "$HOME/.nvm" "$HOME"/.var/app/*/config/nvm; do
+    [ -n "$d" ] && [ -d "$d/versions/node" ] || continue
+    def=$(cat "$d/alias/default" 2>/dev/null || true)
+    bin=$(ls -d "$d/versions/node/v${def#v}"*/bin 2>/dev/null | sort -V | tail -n1 || true)
+    [ -n "$bin" ] || bin=$(ls -d "$d"/versions/node/*/bin 2>/dev/null | sort -V | tail -n1 || true)
+    [ -n "$bin" ] && { echo "$bin"; return 0; }
+  done
+}
+
+has_compose() {
+  local f
+  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do [ -f "$1/$f" ] && return 0; done
+  return 1
+}
+
+# --project, else the repo you're in (if it has a compose file), else the last one
+# used, else the most recently touched repo with a compose file in your home
+find_project() {
+  local p=""
+  if [ -n "$PROJECT_ARG" ]; then
+    p=$(readlink -f "$PROJECT_ARG")
+    [ -d "$p" ] || { warn "--project: $PROJECT_ARG is not a directory"; return 1; }
+  elif p=$(git rev-parse --show-toplevel 2>/dev/null) && has_compose "$p"; then :
+  elif p=$(cat "$STATE_DIR/project" 2>/dev/null) && [ -d "$p" ]; then :
+  else
+    p=$(find "$HOME" -maxdepth 4 \( -path "$HOME/.*" -o -path "$HOME/snap" -o -name node_modules \) -prune \
+             -o -type d -name .git -printf '%T@ %h\n' 2>/dev/null | sort -rn |
+        while read -r _ d; do has_compose "$d" && { echo "$d"; break; }; done || true)
+  fi
+  [ -n "$p" ] || return 0
+  echo "$p" > "$STATE_DIR/project"
+  echo "$p"
+}
+
+# first published port of the project's web service (front/web/client/ui/nginx first, never a db)
+find_frontend_url() {
+  (cd "$PROJECT" && docker compose config --format json 2>/dev/null) | python3 -c '
+import json, re, sys
+services = json.load(sys.stdin).get("services", {})
+db = re.compile(r"postgres|mysql|mariadb|mongo|redis|adminer|pgadmin", re.I)
+def ports(s): return [p for p in s.get("ports", []) if p.get("published")]
+cands = [(n, s) for n, s in services.items() if ports(s) and not db.search(n + s.get("image", ""))]
+cands.sort(key=lambda c: not re.search(r"front|web|client|ui|nginx", c[0], re.I))
+if cands:
+    p = ports(cands[0][1])[0]
+    print(("https" if p.get("target") == 443 else "http") + "://localhost:" + str(p["published"]))
+' 2>/dev/null || true
+}
+
+# --- installing the apps (goinfre) -----------------------------------------------
+
+# ensure_app NAME LATEST URL SHA256 SUBDIR
+# The old install is only replaced once the new one is downloaded and checked.
+# (set -e doesn't apply in functions called with ||, so every step is checked.)
+ensure_app() {
+  local name=$1 latest=$2 url=$3 sha=$4 subdir=$5 dest="$APPS/$1" have tmp
+  have=$(cat "$dest/.installed-version" 2>/dev/null || true)
+  if [ -z "$latest" ]; then
+    if [ -n "$have" ]; then warn "$(label "$name"): no answer from the update server, keeping $have"; return 0; fi
+    warn "$(label "$name"): can't reach the download server"; return 1
+  fi
+  if [ "$have" = "$latest" ]; then log "$(label "$name") $have (up to date)"; return 0; fi
+  if [ -n "$have" ] && pgrep -f "$dest/" >/dev/null; then
+    warn "$(label "$name") $latest is out, close it and run again to update (keeping $have for now)"; return 0
+  fi
+
+  log "Downloading $(label "$name") $latest to $dest"
+  tmp=$(mktemp -d "$GOINFRE/.download.XXXXXX")
+  if ! { curl -fL --progress-bar -o "$tmp/archive" "$url" &&
+         echo "$sha  $tmp/archive" | sha256sum -c --quiet - &&
+         mkdir "$tmp/x" &&
+         case "$url" in
+           *.zip) unzip -q "$tmp/archive" -d "$tmp/x" ;;
+           *)     tar -xzf "$tmp/archive" -C "$tmp/x" ;;
+         esac; }; then
+    rm -rf "$tmp"; warn "$(label "$name"): download failed or checksum didn't match"; return 1
+  fi
+  echo "$latest" > "$tmp/x/$subdir/.installed-version"
+  rm -rf "$dest" && mv "$tmp/x/$subdir" "$dest" && rm -rf "$tmp"
+}
+
+install_vscode() {
+  local meta latest="" url="" sha=""
+  if meta=$(curl -fsSL --max-time 15 "$VSCODE_API"); then
+    latest=$(json_get productVersion <<<"$meta")
+    url=$(json_get url <<<"$meta")
+    sha=$(json_get sha256hash <<<"$meta")
+  fi
+  ensure_app vscode "$latest" "$url" "$sha" VSCode-linux-x64
+}
+
+install_brave() {
+  local latest="" url="" sha=""
+  if latest=$(curl -fsSL --max-time 15 "$BRAVE_VERSION_URL") && [[ $latest =~ ^[0-9.]+$ ]]; then
+    url="https://github.com/brave/brave-browser/releases/download/v$latest/brave-browser-$latest-linux-amd64.zip"
+    sha=$(curl -fsSL --max-time 15 "$url.sha256" | cut -d' ' -f1) || latest=""
+  else
+    latest=""
+  fi
+  ensure_app brave "$latest" "$url" "$sha" ""
+}
+
+# --- copying data from the flatpak apps (home) -----------------------------------
+
+# the native app already holds real data, not just the empty folders a first start leaves
+has_real_data() { [ -e "$1/Default/Preferences" ] || [ -e "$1/User/globalStorage/state.vscdb" ]; }
+
+# import_data NAME OLD NEW
+# Copies everything except caches, once. The flatpak copy is never changed.
+import_data() {
+  local name=$1 old=$2 new=$3 bak root
+  [ -n "$old" ] || return 0
+  if [[ " $REIMPORT " != *" $name "* ]]; then
+    [ -f "$new/$MARKER" ] && return 0
+    if has_real_data "$new"; then
+      printf 'kept=existing\ndate=%s\n' "$(date -Is)" > "$new/$MARKER"
+      log "Keeping the $(label "$name") data you already had in $(pretty "$new") (--reimport $name to use the flatpak one)"
+      return 0
+    fi
+  fi
+  if old_app_running "$old"; then
+    warn "The flatpak $(label "$name") is still open, quit it ($(quit_hint "$name")) and run again so your data can be copied"
+    return 1
+  fi
+  if pgrep -f "$APPS/$name/" >/dev/null; then warn "Close the native $(label "$name") and run again"; return 1; fi
+  if [ -e "$new" ]; then
+    bak="$GOINFRE/backups/$(basename "$new")-$(date +%Y%m%d-%H%M%S)"
+    { mkdir -p "$GOINFRE/backups" && mv "$new" "$bak"; } || { warn "Couldn't move $new out of the way"; return 1; }
+    log "Moved the previous $(pretty "$new") to $bak"
+  fi
+  log "Copying your $(label "$name") data from $(pretty "$old")"
+  mkdir -p "$(dirname "$new")"
+  rsync -a "${CACHE_EXCLUDES[@]}" "$old/" "$new.partial/" &&
+    printf 'from=%s\ndate=%s\n' "$old" "$(date -Is)" > "$new.partial/$MARKER" &&
+    mv "$new.partial" "$new" || { warn "Copying the $(label "$name") data failed"; return 1; }
+  root=$(app_root "$old")
+  [ -z "$root" ] || carry_tool_configs "$root"
+}
+
+# Tools used from a flatpak terminal keep their config in the app's own folder
+# (git's global ignore file for example). Copy what the host doesn't have yet.
+carry_tool_configs() {
+  local root=$1 kind dest item name
+  for kind in config data; do
+    if [ "$kind" = config ]; then dest=$CONF_DIR; else dest=$DATA_DIR; fi
+    for item in "$root/$kind"/*; do
+      [ -e "$item" ] || continue
+      name=$(basename "$item")
+      case "$name" in   # the apps' own data, nvm (used where it is) and desktop stuff
+        BraveSoftware|Code|vscode|nvm|dconf|glib-2.0|gtk-*|ibus|pulse|fontconfig|user-dirs.*|\
+        recently-used.xbel|flatpak*|mimeapps.list|QtProject.conf|kdeglobals) continue ;;
+      esac
+      [ -e "$dest/$name" ] && continue
+      mkdir -p "$dest" && cp -a "$item" "$dest/" && log "Copied $kind/$name from $(pretty "$root") to $(pretty "$dest")/"
+    done
+  done
+}
+
+vscode_ready() { [ -x "$APPS/vscode/bin/code" ] && { [ -z "$OLD_VSCODE" ] || [ -f "$NEW_VSCODE/$MARKER" ]; }; }
+brave_ready()  { [ -x "$APPS/brave/brave" ]     && { [ -z "$OLD_BRAVE" ]  || [ -f "$NEW_BRAVE/$MARKER" ]; }; }
+
+# downloaded .vsix files are only a cache, keep them off the home quota
+link_vsix_cache() {
+  mkdir -p "$GOINFRE/cache/vscode-vsix"
+  [ -L "$NEW_VSCODE/CachedExtensionVSIXs" ] || rm -rf "$NEW_VSCODE/CachedExtensionVSIXs"
+  ln -sfn "$GOINFRE/cache/vscode-vsix" "$NEW_VSCODE/CachedExtensionVSIXs"
+}
+
+# --- launchers -------------------------------------------------------------------
+
+# copy this script to ~/.local/bin so it keeps working wherever it was run from
+install_self() {
+  local target="$INSTALL_DIR/session-setup"
+  [ "$SELF" = "$(readlink -f "$target" 2>/dev/null)" ] && return 0
+  mkdir -p "$INSTALL_DIR"
+  if ! cmp -s "$SELF" "$target"; then
+    install -m 755 "$SELF" "$target"
+    log "Installed $(pretty "$target")"
+  fi
+  SELF=$target
+}
+
+# write_wrapper COMMAND APP, without overwriting a command that isn't ours
+write_wrapper() {
+  local f="$INSTALL_DIR/$1"
+  if [ -e "$f" ] && ! grep -qs 'session-setup' "$f"; then
+    warn "$(pretty "$f") already exists and isn't from session-setup, leaving it alone"; return 0
+  fi
+  printf '#!/bin/sh\nexec "%s" open %s "$@"\n' "$SELF" "$2" > "$f" && chmod +x "$f"
+}
+
+write_launchers() {
+  local icon_vscode icon_brave rc
+  write_wrapper code vscode
+  write_wrapper brave brave
+
+  # the flatpak's icon if there is one, else the app's own
+  icon_vscode=$(app_root "$OLD_VSCODE"); icon_brave=$(app_root "$OLD_BRAVE")
+  [[ $icon_vscode == "$HOME/.var/app/"* ]] && icon_vscode=$(basename "$icon_vscode") \
+    || icon_vscode="$APPS/vscode/resources/app/resources/linux/code.png"
+  [[ $icon_brave == "$HOME/.var/app/"* ]] && icon_brave=$(basename "$icon_brave") \
+    || icon_brave="$APPS/brave/product_logo_256.png"
+
+  mkdir -p "$DATA_DIR/applications"
+  cat > "$DATA_DIR/applications/code-native.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=VS Code (native)
+Comment=VS Code from goinfre, using the GPU
+Exec="$SELF" open vscode %F
+Icon=$icon_vscode
+Categories=Development;IDE;
+StartupWMClass=code
+EOF
+  cat > "$DATA_DIR/applications/brave-native.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Brave (native)
+Comment=Brave from goinfre, using the GPU
+Exec="$SELF" open brave %U
+Icon=$icon_brave
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=$BRAVE_WM_CLASS
+EOF
+
+  case "$(basename "${SHELL:-}")" in
+    zsh)  rc="$HOME/.zshrc" ;;
+    bash) rc="$HOME/.bashrc" ;;
+    *)    return 0 ;;
+  esac
+  if ! grep -qs '# Added by session-setup' "$rc"; then
+    printf '\n# Added by session-setup: personal commands (code, brave, session-setup)\nexport PATH="%s:$PATH"\n' \
+      "${INSTALL_DIR/#$HOME/\$HOME}" >> "$rc"
+    log "Added $(pretty "$INSTALL_DIR") to your PATH in $(pretty "$rc"), open a new terminal to use it"
+  fi
+}
+
+# --- steps -----------------------------------------------------------------------
+
+prepare() {
+  local failed=0
+  if [ "$GOINFRE" = "$HOME/.local/opt" ]; then
+    warn "No goinfre on this post, installing in $(pretty "$GOINFRE") (about 1.5 GB of your home)"
+  fi
+  install_self
+  install_vscode || failed=1
+  install_brave  || failed=1
+  import_data vscode "$OLD_VSCODE" "$NEW_VSCODE" || failed=1
+  import_data brave  "$OLD_BRAVE"  "$NEW_BRAVE"  || failed=1
+  if vscode_ready; then link_vsix_cache; fi
+  write_launchers
+  return $failed
+}
+
+free_ram() {
+  # sits on ~300 MB doing nothing, GNOME starts it again at next login
+  if pkill -x gnome-software; then log "Stopped gnome-software (~300 MB of RAM back)"; fi
+}
+
+start_stack() {
+  local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+  [ -n "${DOCKER_HOST:-}" ] || [ ! -S "$sock" ] || export DOCKER_HOST="unix://$sock"
+  if ! docker info >/dev/null 2>&1; then
+    if systemctl --user cat docker.service >/dev/null 2>&1; then
+      log "Starting rootless docker"
+      systemctl --user start docker || { warn "Docker didn't start, see: systemctl --user status docker"; FAILED=1; return 0; }
+      [ -n "${DOCKER_HOST:-}" ] || export DOCKER_HOST="unix://$sock"
+    else
+      warn "Docker isn't running and there's no rootless docker service in your home"; FAILED=1; return 0
+    fi
+  fi
+  if [ -z "$PROJECT" ] || ! has_compose "$PROJECT"; then return 0; fi
+  log "Starting the $(basename "$PROJECT") containers (on a new post the images get built first)"
+  (cd "$PROJECT" && docker compose up -d) || { warn "docker compose up failed, see: cd $PROJECT && docker compose logs"; FAILED=1; }
+}
+
+launch_apps() {
+  local url="" old
+  if vscode_ready; then
+    log "Opening VS Code${PROJECT:+ on $(pretty "$PROJECT")}"
+    setsid -f "$SELF" open vscode ${PROJECT:+"$PROJECT"} >/dev/null 2>&1
+  fi
+  if brave_ready && ! pgrep -f "$APPS/brave/" >/dev/null; then
+    if [ -n "$PROJECT" ] && [ "$NO_DOCKER" = 0 ]; then url=$(find_frontend_url); fi
+    log "Opening Brave${url:+ on $url}"
+    setsid -f "$SELF" open brave ${url:+"$url"} >/dev/null 2>&1
+  fi
+  for old in "$OLD_VSCODE" "$OLD_BRAVE"; do
+    if [ -n "$old" ] && old_app_running "$old"; then
+      warn "$(basename "$(app_root "$old")") (flatpak) is still open, it renders on the CPU so better close it"
+    fi
+  done
+}
+
+# what `code`, `brave` and the app grid entries run: set things up if this post
+# doesn't have the app yet, then start it
+open_app() {
+  local name=$1; shift
+  if ! "${name}_ready"; then
+    notify "Getting $(label "$name") ready on this post, takes about a minute..."
+    prepare >"$STATE_DIR/last-run.log" 2>&1 || true
+    if ! "${name}_ready"; then
+      notify "$(label "$name") isn't ready: $(grep -h '^!!' "$STATE_DIR/last-run.log" | tail -n1 | cut -c5-)"
+      exit 1
+    fi
+  fi
+  case "$name" in
+    vscode)
+      local node_bin; node_bin=$(find_node_bin)
+      export PATH="$INSTALL_DIR${node_bin:+:$node_bin}:$PATH"
+      exec "$APPS/vscode/bin/code" --extensions-dir "$VSCODE_EXTENSIONS" "$@" ;;
+    brave)
+      exec "$APPS/brave/brave" --class="$BRAVE_WM_CLASS" --disk-cache-size="$BRAVE_CACHE_BYTES" "$@" ;;
+  esac
+}
+
+main() {
+  local mode=full
+  PROJECT_ARG="" REIMPORT="" NO_DOCKER=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prepare)   mode=prepare ;;
+      --no-docker) NO_DOCKER=1 ;;
+      --project)   PROJECT_ARG=${2:?--project needs a directory}; shift ;;
+      --reimport)
+        case "${2:-}" in
+          vscode|code) REIMPORT=vscode; shift ;;
+          brave)       REIMPORT=brave; shift ;;
+          *)           REIMPORT="vscode brave" ;;
+        esac ;;
+      open)
+        case "${2:-}" in
+          vscode|code) OPEN_APP=vscode ;;
+          brave)       OPEN_APP=brave ;;
+          *) echo "usage: session-setup open vscode|brave [ARGS]" >&2; exit 2 ;;
+        esac
+        mode=open; shift 2; break ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  GOINFRE=$(find_goinfre)
+  APPS="$GOINFRE/apps"
+  OLD_VSCODE=$(newest "$HOME"/.var/app/*/config/Code "$HOME"/snap/code/current/.config/Code)
+  OLD_BRAVE=$(newest "$HOME"/.var/app/*/config/BraveSoftware/Brave-Browser \
+                     "$HOME"/snap/brave/current/.config/BraveSoftware/Brave-Browser)
+  VSCODE_EXTENSIONS=$(find_vscode_extensions)
+  mkdir -p "$APPS" "$STATE_DIR"
+  chmod 700 "$GOINFRE" 2>/dev/null || true
+
+  if [ "$mode" = open ]; then open_app "$OPEN_APP" "$@"; fi
+
+  PROJECT=""
+  [ "$mode" = prepare ] || PROJECT=$(find_project) || FAILED=1
+  log "goinfre:            $GOINFRE"
+  log "flatpak VS Code:    $(pretty "${OLD_VSCODE:-not found}")"
+  log "VS Code extensions: $(pretty "$VSCODE_EXTENSIONS")"
+  log "flatpak Brave:      $(pretty "${OLD_BRAVE:-not found}")"
+  [ "$mode" = prepare ] || log "project:            $(pretty "${PROJECT:-not found (use --project DIR)}")"
+
+  prepare || FAILED=1
+  if [ "$mode" = full ]; then
+    free_ram
+    [ "$NO_DOCKER" = 1 ] || start_stack
+    launch_apps
+  fi
+  if [ "$FAILED" = 0 ]; then log "Done."; else warn "Done, but with warnings (see above)"; exit 1; fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
