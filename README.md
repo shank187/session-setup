@@ -51,6 +51,15 @@ Measured on a 1337 workstation (Intel i5-7500, AMD Radeon RX 470/580, 8 GB RAM),
 
 Ten times the frame rate for the same CPU usage (60 fps is the screen's limit). Plain scrolling was already smooth; the difference shows on anything animated or graphics-heavy, like design tools, 3D viewers and animated dashboards. With rendering on the GPU, the CPU stays free for your work.
 
+VS Code changes the same way, plus it leaves the sandbox:
+
+| | Flatpak VS Code | VS Code from session-setup |
+|---|---|---|
+| Renderer | llvmpipe (CPU) | AMD Radeon (GPU) |
+| Terminal can run `docker` and your nvm `node` | No, only through `host-spawn` | Yes, it's a regular terminal |
+| Extensions | | The same ones, shared with the flatpak VS Code |
+| Settings, recent projects, open files | | Copied over on the first run |
+
 WebGL, checked on [get.webgl.org](https://get.webgl.org):
 
 | Flatpak Brave | Brave from session-setup |
@@ -73,6 +82,7 @@ Your data is copied from the flatpak apps once, on your very first run.
 - Keeps the large app files out of your home quota, and your data in your home where it follows you
 - Adds `brave` and `code` commands and app menu entries, which install the apps by themselves on a workstation that doesn't have them yet
 - Makes links from other apps open the new Brave, if the flatpak Brave was your default browser
+- Closes the old flatpak apps for you when they're still running in the background
 - Runs VS Code outside the flatpak sandbox, with a regular terminal and your nvm Node on the PATH
 - Detects everything at runtime, so the same script works for anyone, on any workstation
 
@@ -105,6 +115,7 @@ Day to day, use "Brave (native)" and "VS Code (native)" from the app menu, or th
 |---|---|
 | `session-setup` | Install or update the apps, copy your data if needed, open both apps |
 | `session-setup --prepare` | Same, without opening the apps |
+| `session-setup --close-old` | Close the flatpak Brave and VS Code first, even if they're running in the background |
 | `session-setup --reimport [vscode\|brave]` | Copy the flatpak data again (your current data is backed up first) |
 | `session-setup open vscode\|brave [args]` | Start one app, installing it first if needed (this is what `code`, `brave` and the app menu entries run) |
 | `session-setup --version` | Print the version |
@@ -128,6 +139,7 @@ No sudo, nothing outside your home and your goinfre. Specifically:
 - Adds one line to your `.zshrc` or `.bashrc` to put `~/.local/bin` on your PATH
 - Creates `~/.config/BraveSoftware`, `~/.config/Code` and `~/.config/session-setup`
 - Sets "Brave (native)" as your default browser, only if the flatpak Brave was the default
+- Closes the flatpak Brave and VS Code only when you say so (by answering yes, or with `--close-old`)
 - Puts the apps, a download cache and backups in `/goinfre/$USER`
 - Stops the `gnome-software` background service when you run it (it comes back at next login)
 
@@ -214,8 +226,8 @@ Exact locations:
 
 ## FAQ
 
-**It says the flatpak Brave or VS Code is still open.**
-Quit it completely (Brave: Ctrl+Shift+Q, VS Code: File > Exit) and run `session-setup` again. Your data is only copied while the old app is closed, so the copy is consistent.
+**It says the flatpak Brave or VS Code is still running.**
+Brave can keep running in the background after you close its window. When you run `session-setup` in a terminal, it offers to close it for you; `session-setup --close-old` does it without asking. The app is asked to quit properly first, so Brave saves your tabs, and is only forced if it hasn't quit after 15 seconds. Your data is only copied while the old app is closed, so the copy is consistent.
 
 **Can I go back to the flatpak apps?**
 Yes. Their data is untouched, just open them from the app menu. Anything you did in the new apps since the copy won't be there.
