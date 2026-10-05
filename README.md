@@ -2,11 +2,23 @@
 
 GPU-accelerated Brave and VS Code on 1337 / 42 workstations, set up in one command.
 
+<p align="center">
+  <img src="docs/demo.webp" alt="The same animated test page in the flatpak Brave (about 6 frames per second) and in the Brave installed by session-setup (60 frames per second)" width="836">
+  <br>
+  <sub>The same test page, recorded in both browsers on a 1337 workstation.</sub>
+</p>
+
 session-setup installs the official Brave and VS Code builds in goinfre, moves your data over from the flatpak versions, and keeps everything working as you move from one workstation to another.
 
 ## Why
 
 The 1337 workstations run Ubuntu 22.04 with kernel 5.15. Brave and VS Code are installed as flatpaks, and the flatpak runtime ships Mesa 26, which needs kernel 6.6 or newer. On these machines it can't use the GPU, so it falls back to software rendering (llvmpipe) and everything those apps draw goes through the 4 CPU cores, the same cores your compiler, containers and dev servers need.
+
+You can see it in `brave://gpu`:
+
+| Flatpak Brave | Brave from session-setup |
+|---|---|
+| ![brave://gpu in the flatpak Brave: canvas, compositing and rasterization are software only, OpenGL and WebGL are disabled](docs/gpu-flatpak.png) | ![brave://gpu in the Brave from session-setup: canvas, compositing, rasterization, OpenGL and WebGL are hardware accelerated](docs/gpu-native.png) |
 
 In practice that means:
 
@@ -14,13 +26,16 @@ In practice that means:
 - WebGL is turned off, so Figma (which requires WebGL), 3D viewers and other WebGL sites don't work
 - VS Code runs in a sandbox: its terminal can't see the tools installed on the system, so everything goes through `host-spawn`
 
-You can check it yourself: open `brave://gpu` in the flatpak Brave, the renderer is `llvmpipe`.
-
 The official Linux builds of Brave and VS Code use the system's own graphics drivers, which work with the GPU. They don't fit in the 10 GB home quota, so session-setup puts them in goinfre and keeps your data in your home.
 
 ### Before and after
 
-Same test page in both browsers, on a 1337 workstation (Intel i5-7500, AMD Radeon RX 470/580, 8 GB RAM):
+Measured on a 1337 workstation (Intel i5-7500, AMD Radeon RX 470/580, 8 GB RAM), same test page in both browsers:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/fps-dark.svg">
+  <img src="docs/fps-light.svg" alt="Frames per second. 400 animated elements: flatpak Brave 6, Brave from session-setup 60. Scrolling a long page: 60 in both." width="760">
+</picture>
 
 | | Flatpak Brave | Brave from session-setup |
 |---|---|---|
@@ -31,6 +46,12 @@ Same test page in both browsers, on a 1337 workstation (Intel i5-7500, AMD Radeo
 | Scrolling a long page | 60 fps | 60 fps |
 
 Ten times the frame rate for the same CPU usage (60 fps is the screen's limit). Plain scrolling was already smooth; the difference shows on anything animated or graphics-heavy, like design tools, 3D viewers and animated dashboards. With rendering on the GPU, the CPU stays free for your work.
+
+WebGL, checked on [get.webgl.org](https://get.webgl.org):
+
+| Flatpak Brave | Brave from session-setup |
+|---|---|
+| ![get.webgl.org in the flatpak Brave: WebGL is disabled or unavailable](docs/webgl-flatpak.png) | ![get.webgl.org in the Brave from session-setup: your browser supports WebGL, with the spinning cube](docs/webgl-native.png) |
 
 ### Setup time
 
@@ -84,9 +105,40 @@ Day to day, use "Brave (native)" and "VS Code (native)" from the app menu, or th
 
 ## How it works
 
+What a run does:
+
+```mermaid
+flowchart LR
+    run([session-setup]) --> apps{Apps missing<br/>or outdated?}
+    apps -- yes --> dl[Download to goinfre<br/>and verify SHA-256]
+    apps -- no --> first
+    dl --> first{First run?}
+    first -- yes --> copy[Copy your flatpak data<br/>once, without caches]
+    first -- no --> open
+    copy --> open([Open Brave and VS Code<br/>on the GPU])
+```
+
 ### Storage
 
-42 workstations give you two places to keep files:
+42 workstations give you two places to keep files, and session-setup uses each for what it's good at:
+
+```mermaid
+flowchart LR
+    subgraph goinfre["goinfre: hundreds of GB, this workstation only"]
+        direction TB
+        bapp[Brave]
+        vapp[VS Code]
+        bak[Backups from --reimport]
+    end
+    subgraph home["Home: 10 GB, on every workstation"]
+        direction TB
+        bprof[Brave profile<br/>logins, tabs, extensions, history]
+        vdata[VS Code settings and state]
+        script[session-setup, code, brave]
+    end
+    bapp -- uses --> bprof
+    vapp -- uses --> vdata
+```
 
 | | Home (`~`) | goinfre (`/goinfre/$USER`) |
 |---|---|---|
