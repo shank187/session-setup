@@ -1,5 +1,7 @@
 # session-setup
 
+[![lint](https://github.com/shank187/session-setup/actions/workflows/lint.yml/badge.svg)](https://github.com/shank187/session-setup/actions/workflows/lint.yml)
+
 GPU-accelerated Brave and VS Code on 1337 / 42 workstations, set up in one command.
 
 <p align="center">
@@ -12,7 +14,7 @@ session-setup installs the official Brave and VS Code builds in goinfre, moves y
 
 ## Why
 
-The 1337 workstations run Ubuntu 22.04 with kernel 5.15. Brave and VS Code are installed as flatpaks, and the flatpak runtime ships Mesa 26, which needs kernel 6.6 or newer. On these machines it can't use the GPU, so it falls back to software rendering (llvmpipe) and everything those apps draw goes through the 4 CPU cores, the same cores your compiler, containers and dev servers need.
+The 1337 iMacs run Ubuntu 22.04 with kernel 5.15 and an AMD Radeon GPU. Brave and VS Code are installed as flatpaks, and the flatpak runtime ships Mesa 26, whose AMD driver needs kernel 6.6 or newer. So it can't use the GPU and falls back to software rendering (llvmpipe): everything those apps draw goes through the CPU, the same CPU your compiler, containers and dev servers need.
 
 You can see it in `brave://gpu`:
 
@@ -27,6 +29,8 @@ In practice that means:
 - VS Code runs in a sandbox: its terminal can't see the tools installed on the system, so everything goes through `host-spawn`
 
 The official Linux builds of Brave and VS Code use the system's own graphics drivers, which work with the GPU. They don't fit in the 10 GB home quota, so session-setup puts them in goinfre and keeps your data in your home.
+
+Not sure about your workstation? Open `brave://gpu` in the flatpak Brave. If it says "Software only" like above, you're affected. If it already says "Hardware accelerated", the GPU part doesn't apply to you, though the rest (VS Code outside the sandbox, apps outside your quota) still does.
 
 ### Before and after
 
@@ -68,6 +72,7 @@ Your data is copied from the flatpak apps once, on your very first run.
 - Copies your flatpak Brave and VS Code data once: logins, saved passwords, bookmarks, open tabs, extensions, settings, history
 - Keeps the large app files out of your home quota, and your data in your home where it follows you
 - Adds `brave` and `code` commands and app menu entries, which install the apps by themselves on a workstation that doesn't have them yet
+- Makes links from other apps open the new Brave, if the flatpak Brave was your default browser
 - Runs VS Code outside the flatpak sandbox, with a regular terminal and your nvm Node on the PATH
 - Detects everything at runtime, so the same script works for anyone, on any workstation
 
@@ -102,6 +107,31 @@ Day to day, use "Brave (native)" and "VS Code (native)" from the app menu, or th
 | `session-setup --prepare` | Same, without opening the apps |
 | `session-setup --reimport [vscode\|brave]` | Copy the flatpak data again (your current data is backed up first) |
 | `session-setup open vscode\|brave [args]` | Start one app, installing it first if needed (this is what `code`, `brave` and the app menu entries run) |
+| `session-setup --version` | Print the version |
+
+### Updating
+
+From the folder you cloned:
+
+```sh
+git pull && ./session-setup
+```
+
+Brave and VS Code are kept up to date by the script; this updates the script itself.
+
+## What it changes on your account
+
+No sudo, nothing outside your home and your goinfre. Specifically:
+
+- Adds `session-setup`, `code` and `brave` to `~/.local/bin` (an existing `code` or `brave` that isn't from session-setup is left alone)
+- Adds "Brave (native)" and "VS Code (native)" to `~/.local/share/applications`
+- Adds one line to your `.zshrc` or `.bashrc` to put `~/.local/bin` on your PATH
+- Creates `~/.config/BraveSoftware`, `~/.config/Code` and `~/.config/session-setup`
+- Sets "Brave (native)" as your default browser, only if the flatpak Brave was the default
+- Puts the apps, a download cache and backups in `/goinfre/$USER`
+- Stops the `gnome-software` background service when you run it (it comes back at next login)
+
+The flatpak apps and their data are never modified.
 
 ## How it works
 
@@ -166,7 +196,7 @@ Exact locations:
 
 - Done once per app, caches excluded. The flatpak data is never modified, so you can always go back.
 - VS Code extensions are shared with the flatpak VS Code rather than copied, to save space.
-- If you already have native Brave or VS Code data in `~/.config`, it is kept. `--reimport` replaces it and moves the previous data to goinfre.
+- If you already have native Brave or VS Code data in `~/.config`, it is kept. `--reimport` replaces it and moves the previous data to `goinfre/backups`, which only exists on that workstation.
 - Configs that tools created from inside the flatpak terminal (git's global ignore file, for example) are copied to `~/.config` when you don't have them already.
 
 ### Detected at runtime
@@ -178,8 +208,23 @@ Exact locations:
 
 ### Also
 
-- Stops `gnome-software`, which uses around 300 MB of RAM in the background (it comes back at next login)
+- Stops the `gnome-software` background service, which uses around 300 MB of RAM (it comes back at next login)
 - Limits Brave's disk cache to 500 MB
+- Runs one instance at a time, so running it in a terminal while an app entry sets things up is safe
+
+## FAQ
+
+**It says the flatpak Brave or VS Code is still open.**
+Quit it completely (Brave: Ctrl+Shift+Q, VS Code: File > Exit) and run `session-setup` again. Your data is only copied while the old app is closed, so the copy is consistent.
+
+**Can I go back to the flatpak apps?**
+Yes. Their data is untouched, just open them from the app menu. Anything you did in the new apps since the copy won't be there.
+
+**I kept using the flatpak Brave for a while. How do I bring that over?**
+`session-setup --reimport brave` copies it again. Your current native profile goes to `goinfre/backups` first.
+
+**Is the download safe?**
+VS Code comes from Microsoft's download servers and Brave from its official GitHub releases, both over HTTPS, and their published SHA-256 checksums are verified before anything is installed. The script is a single readable bash file, so you can check what it does before running it.
 
 ## Requirements
 
