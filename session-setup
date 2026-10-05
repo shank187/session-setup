@@ -4,7 +4,7 @@
 #
 # Installs the official Brave and VS Code builds in goinfre (the flatpak ones
 # can't use the GPU on these machines), copies your data over from the flatpak
-# apps once, starts docker + your project and opens everything.
+# apps once and opens them.
 #
 # session-setup --help for the options, README.md for the details.
 
@@ -53,11 +53,8 @@ usage() {
 usage: session-setup [options]
 
   (no options)               install/update Brave and VS Code, copy your data from
-                             the flatpak apps (first run only), start docker and
-                             your project, open everything
+                             the flatpak apps (first run only), open both
   --prepare                  only install/update and copy data
-  --no-docker                everything except docker
-  --project DIR              use DIR as the project (remembered for next time)
   --reimport [vscode|brave]  copy the flatpak data again; the current native data
                              is moved to <goinfre>/backups first
   open vscode|brave [ARGS]   start the native app (what `code`, `brave` and the
@@ -126,46 +123,6 @@ find_node_bin() {
     [ -n "$bin" ] || bin=$(ls -d "$d"/versions/node/*/bin 2>/dev/null | sort -V | tail -n1 || true)
     [ -n "$bin" ] && { echo "$bin"; return 0; }
   done
-}
-
-has_compose() {
-  local f
-  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do [ -f "$1/$f" ] && return 0; done
-  return 1
-}
-
-# --project, else the repo you're in (if it has a compose file), else the last one
-# used, else the most recently touched repo with a compose file in your home
-find_project() {
-  local p=""
-  if [ -n "$PROJECT_ARG" ]; then
-    p=$(readlink -f "$PROJECT_ARG")
-    [ -d "$p" ] || { warn "--project: $PROJECT_ARG is not a directory"; return 1; }
-  elif p=$(git rev-parse --show-toplevel 2>/dev/null) && has_compose "$p"; then :
-  elif p=$(cat "$STATE_DIR/project" 2>/dev/null) && [ -d "$p" ]; then :
-  else
-    p=$(find "$HOME" -maxdepth 4 \( -path "$HOME/.*" -o -path "$HOME/snap" -o -name node_modules \) -prune \
-             -o -type d -name .git -printf '%T@ %h\n' 2>/dev/null | sort -rn |
-        while read -r _ d; do has_compose "$d" && { echo "$d"; break; }; done || true)
-  fi
-  [ -n "$p" ] || return 0
-  echo "$p" > "$STATE_DIR/project"
-  echo "$p"
-}
-
-# first published port of the project's web service (front/web/client/ui/nginx first, never a db)
-find_frontend_url() {
-  (cd "$PROJECT" && docker compose config --format json 2>/dev/null) | python3 -c '
-import json, re, sys
-services = json.load(sys.stdin).get("services", {})
-db = re.compile(r"postgres|mysql|mariadb|mongo|redis|adminer|pgadmin", re.I)
-def ports(s): return [p for p in s.get("ports", []) if p.get("published")]
-cands = [(n, s) for n, s in services.items() if ports(s) and not db.search(n + s.get("image", ""))]
-cands.sort(key=lambda c: not re.search(r"front|web|client|ui|nginx", c[0], re.I))
-if cands:
-    p = ports(cands[0][1])[0]
-    print(("https" if p.get("target") == 443 else "http") + "://localhost:" + str(p["published"]))
-' 2>/dev/null || true
 }
 
 # --- installing the apps (goinfre) -----------------------------------------------
@@ -379,33 +336,15 @@ free_ram() {
   if pkill -x gnome-software; then log "Stopped gnome-software (~300 MB of RAM back)"; fi
 }
 
-start_stack() {
-  local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
-  [ -n "${DOCKER_HOST:-}" ] || [ ! -S "$sock" ] || export DOCKER_HOST="unix://$sock"
-  if ! docker info >/dev/null 2>&1; then
-    if systemctl --user cat docker.service >/dev/null 2>&1; then
-      log "Starting rootless docker"
-      systemctl --user start docker || { warn "Docker didn't start, see: systemctl --user status docker"; FAILED=1; return 0; }
-      [ -n "${DOCKER_HOST:-}" ] || export DOCKER_HOST="unix://$sock"
-    else
-      warn "Docker isn't running and there's no rootless docker service in your home"; FAILED=1; return 0
-    fi
-  fi
-  if [ -z "$PROJECT" ] || ! has_compose "$PROJECT"; then return 0; fi
-  log "Starting the $(basename "$PROJECT") containers (on a new post the images get built first)"
-  (cd "$PROJECT" && docker compose up -d) || { warn "docker compose up failed, see: cd $PROJECT && docker compose logs"; FAILED=1; }
-}
-
 launch_apps() {
-  local url="" old
-  if vscode_ready; then
-    log "Opening VS Code${PROJECT:+ on $(pretty "$PROJECT")}"
-    setsid -f "$SELF" open vscode ${PROJECT:+"$PROJECT"} >/dev/null 2>&1
+  local old
+  if vscode_ready && ! pgrep -f "$APPS/vscode/" >/dev/null; then
+    log "Opening VS Code"
+    setsid -f "$SELF" open vscode >/dev/null 2>&1
   fi
   if brave_ready && ! pgrep -f "$APPS/brave/" >/dev/null; then
-    if [ -n "$PROJECT" ] && [ "$NO_DOCKER" = 0 ]; then url=$(find_frontend_url); fi
-    log "Opening Brave${url:+ on $url}"
-    setsid -f "$SELF" open brave ${url:+"$url"} >/dev/null 2>&1
+    log "Opening Brave"
+    setsid -f "$SELF" open brave >/dev/null 2>&1
   fi
   for old in "$OLD_VSCODE" "$OLD_BRAVE"; do
     if [ -n "$old" ] && old_app_running "$old"; then
@@ -438,12 +377,10 @@ open_app() {
 
 main() {
   local mode=full
-  PROJECT_ARG="" REIMPORT="" NO_DOCKER=0
+  REIMPORT=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --prepare)   mode=prepare ;;
-      --no-docker) NO_DOCKER=1 ;;
-      --project)   PROJECT_ARG=${2:?--project needs a directory}; shift ;;
+      --prepare) mode=prepare ;;
       --reimport)
         case "${2:-}" in
           vscode|code) REIMPORT=vscode; shift ;;
@@ -474,18 +411,14 @@ main() {
 
   if [ "$mode" = open ]; then open_app "$OPEN_APP" "$@"; fi
 
-  PROJECT=""
-  [ "$mode" = prepare ] || PROJECT=$(find_project) || FAILED=1
   log "goinfre:            $GOINFRE"
   log "flatpak VS Code:    $(pretty "${OLD_VSCODE:-not found}")"
   log "VS Code extensions: $(pretty "$VSCODE_EXTENSIONS")"
   log "flatpak Brave:      $(pretty "${OLD_BRAVE:-not found}")"
-  [ "$mode" = prepare ] || log "project:            $(pretty "${PROJECT:-not found (use --project DIR)}")"
 
   prepare || FAILED=1
   if [ "$mode" = full ]; then
     free_ram
-    [ "$NO_DOCKER" = 1 ] || start_stack
     launch_apps
   fi
   if [ "$FAILED" = 0 ]; then log "Done."; else warn "Done, but with warnings (see above)"; exit 1; fi
