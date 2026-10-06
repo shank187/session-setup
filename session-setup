@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION=1.1.0
+VERSION=1.1.1
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # Inside a flatpak (e.g. the VS Code flatpak terminal): run on the host instead,
@@ -439,6 +439,22 @@ launch_apps() {
   done
 }
 
+# Brave locks its profile with a SingletonLock link to "<host>-<pid>". Leave a post
+# with Brave still open and the lock stays in your home; Brave on the next post then
+# refuses to start, as it can't check a process on another computer. A home that is
+# mounted on one post at a time can't be in use elsewhere, so that lock is stale.
+clear_stale_brave_lock() {
+  local owner host
+  owner=$(readlink "$NEW_BRAVE/SingletonLock" 2>/dev/null) || return 0
+  host=${owner%-*}
+  [ "$host" != "$(uname -n)" ] || return 0   # Brave sorts out locks from this post itself
+  case "$(stat -f -c %T "$NEW_BRAVE" 2>/dev/null)" in
+    nfs*|cifs|smb*|afs|ceph|fuse*) return 0 ;;   # home shared between posts, could be live
+  esac
+  rm -f "$NEW_BRAVE/SingletonLock" "$NEW_BRAVE/SingletonCookie" "$NEW_BRAVE/SingletonSocket"
+  log "Unlocked the Brave profile (left locked by $host)"
+}
+
 # what `code`, `brave` and the app grid entries run: set things up if this post
 # doesn't have the app yet, then start it
 open_app() {
@@ -460,6 +476,7 @@ open_app() {
       export PATH="$INSTALL_DIR${node_bin:+:$node_bin}:$PATH"
       exec "$APPS/vscode/bin/code" --extensions-dir "$VSCODE_EXTENSIONS" "$@" ;;
     brave)
+      clear_stale_brave_lock
       exec "$APPS/brave/brave" --class="$BRAVE_WM_CLASS" --disk-cache-size="$BRAVE_CACHE_BYTES" "$@" ;;
   esac
 }

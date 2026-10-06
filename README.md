@@ -140,6 +140,7 @@ No sudo, nothing outside your home and your goinfre. Specifically:
 - Creates `~/.config/BraveSoftware`, `~/.config/Code` and `~/.config/session-setup`
 - Sets "Brave (native)" as your default browser, only if the flatpak Brave was the default
 - Closes the flatpak Brave and VS Code only when you say so (by answering yes, or with `--close-old`)
+- Removes the lock Brave leaves in its profile when you leave a post with Brave open, so it starts on the next post
 - Puts the apps, a download cache and backups in `/goinfre/$USER`
 - Stops the `gnome-software` background service when you run it (it comes back at next login)
 
@@ -228,6 +229,9 @@ Exact locations:
 
 **It says the flatpak Brave or VS Code is still running.**
 Brave can keep running in the background after you close its window. When you run `session-setup` in a terminal, it offers to close it for you; `session-setup --close-old` does it without asking. The app is asked to quit properly first, so Brave saves your tabs, and is only forced if it hasn't quit after 15 seconds. Your data is only copied while the old app is closed, so the copy is consistent.
+
+**Brave says the profile is in use by another Brave process on another computer.**
+That happens after you leave a post with Brave still open: Brave doesn't get to remove the lock it keeps in your profile, and on the next post it can't check whether that process is still running. Your home is only used on one post at a time, so session-setup removes a lock left by another post before it starts Brave (since 1.1.1, see [Updating](#updating)). If you still get the message, Brave was started another way; "Unlock profile and relaunch" is safe as long as you're not logged in on the other post. If your home is on a network drive (NFS), session-setup leaves the lock alone, since the other Brave could really be running.
 
 **Can I go back to the flatpak apps?**
 Yes. Their data is untouched, just open them from the app menu. Anything you did in the new apps since the copy won't be there.
