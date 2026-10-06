@@ -84,6 +84,7 @@ Your data is copied from the flatpak apps once, on your very first run.
 - Makes links from other apps open the new Brave, if the flatpak Brave was your default browser
 - Closes the old flatpak apps for you when they're still running in the background
 - Runs VS Code outside the flatpak sandbox, with a regular terminal and your nvm Node on the PATH
+- Can set up IntelliJ IDEA the same way if you use it, out of the sandbox and with more free features (`--add idea`)
 - Detects everything at runtime, so the same script works for anyone, on any workstation
 
 ## Installation
@@ -116,9 +117,47 @@ Day to day, use "Brave (native)" and "VS Code (native)" from the app menu, or th
 | `session-setup` | Install or update the apps, copy your data if needed, open both apps |
 | `session-setup --prepare` | Same, without opening the apps |
 | `session-setup --close-old` | Close the flatpak Brave and VS Code first, even if they're running in the background |
-| `session-setup --reimport [vscode\|brave]` | Copy the flatpak data again (your current data is backed up first) |
-| `session-setup open vscode\|brave [args]` | Start one app, installing it first if needed (this is what `code`, `brave` and the app menu entries run) |
+| `session-setup --reimport [vscode\|brave\|idea]` | Copy the flatpak data again (your current data is backed up first) |
+| `session-setup --add idea` | Also set up IntelliJ IDEA, see [below](#intellij-idea-optional) |
+| `session-setup --remove idea` | Stop setting up IntelliJ IDEA and remove it from goinfre (your settings are kept) |
+| `session-setup open vscode\|brave\|idea [args]` | Start one app, installing it first if needed (this is what `code`, `brave`, `idea` and the app menu entries run) |
 | `session-setup --version` | Print the version |
+
+### IntelliJ IDEA (optional)
+
+The workstations also have IntelliJ IDEA Community as a flatpak. If you use it, session-setup can set up the official IntelliJ IDEA the same way:
+
+```sh
+session-setup --add idea
+```
+
+It's off unless you turn it on, because it's a 1.6 GB download (4.3 GB unpacked) on every workstation you use. Once it's on, every `session-setup` keeps it installed and up to date, after Brave and VS Code have opened so it never holds them up. It doesn't open IntelliJ for you, since it takes 2 to 3 GB of RAM: use the `idea` command or "IntelliJ IDEA (native)" in the app menu. On a workstation that doesn't have it yet, `idea` installs it first, which took about a minute and a half in our test.
+
+What you get over the flatpak:
+
+| | Flatpak IntelliJ | IntelliJ from session-setup |
+|---|---|---|
+| Version | Community 2025.1 | IntelliJ IDEA 2026.2, kept up to date |
+| Terminal, builds and run configurations see | Only the sandbox: no `java`, no system JDKs, no `docker`, `zsh`, `node` or `norminette` | The whole workstation, including Java 11 and 17 in `/usr/lib/jvm` |
+| Free features | Community | Community plus Spring Boot, Spring Initializr, Database Tools and SQL, Docker, HTTP Client, JavaScript and TypeScript, React, Lombok and more |
+| With a JetBrains license (free for students) | Can't be used | Everything else: Spring Web, Data and Security, Hibernate, Node.js, Kubernetes, ... |
+| Caches and indexes | In your home, against the 10 GB quota | In goinfre |
+
+It isn't faster, though, and the newer version is heavier. Brave and VS Code are slow in the flatpak because they draw through its graphics driver; IntelliJ draws its window through the system's display server either way, so leaving the flatpak doesn't speed it up (the same version, 2025.1, ran about as fast in and out of it). Measured on a 1337 iMac with 8 GB of RAM and the same 1,900-file Java project:
+
+| | Flatpak IntelliJ 2025.1 | IntelliJ 2026.2 |
+|---|---|---|
+| First opening of the project (empty caches) | 69 to 98 s | 116 to 141 s |
+| Opening it again | 43 to 72 s | 32 to 127 s |
+| Highlighting a 9,600-line file | 18 to 29 s | 30 to 52 s |
+| Typing latency | 10 to 16 ms | 17 to 24 ms |
+| Memory at peak | 2.0 to 2.3 GB | 2.9 to 3.4 GB |
+
+Both froze for a few seconds now and then while typing, when the post ran out of memory and started swapping. The extra gigabyte is what you'll notice on 8 GB with Brave, VS Code and Docker open. And because its caches are in goinfre, the first opening of a project on each new post is the slow one, where the flatpak keeps its caches in your home. So turn it on for what the table above it gives you, not for speed.
+
+Your settings come with you: the first time, session-setup copies the flatpak IntelliJ settings and plugins to `~/.config/JetBrains`, and IntelliJ imports them itself on its first start (keymap, fonts, live templates, JDKs, recent projects, plugins, memory settings). On that first start it also asks you to accept the JetBrains User Agreement and whether to share usage statistics.
+
+`session-setup --remove idea` turns it off and removes it from goinfre. Your settings stay in `~/.config/JetBrains`.
 
 ### Updating
 
@@ -141,6 +180,7 @@ No sudo, nothing outside your home and your goinfre. Specifically:
 - Sets "Brave (native)" as your default browser, only if the flatpak Brave was the default
 - Closes the flatpak Brave and VS Code only when you say so (by answering yes, or with `--close-old`)
 - Removes the lock Brave leaves in its profile when you leave a post with Brave open, so it starts on the next post
+- Only with `--add idea`: adds an `idea` command and an "IntelliJ IDEA (native)" app entry, copies the flatpak IntelliJ settings to `~/.config/JetBrains` once, keeps IntelliJ's caches in goinfre and clears the locks it leaves when it doesn't shut down cleanly
 - Puts the apps, a download cache and backups in `/goinfre/$USER`
 - Stops the `gnome-software` background service when you run it (it comes back at next login)
 
@@ -233,6 +273,9 @@ Brave can keep running in the background after you close its window. When you ru
 **Brave says the profile is in use by another Brave process on another computer.**
 That happens after you leave a post with Brave still open: Brave doesn't get to remove the lock it keeps in your profile, and on the next post it can't check whether that process is still running. Your home is only used on one post at a time, so session-setup removes a lock left by another post before it starts Brave (since 1.1.1, see [Updating](#updating)). If you still get the message, Brave was started another way; "Unlock profile and relaunch" is safe as long as you're not logged in on the other post. If your home is on a network drive (NFS), session-setup leaves the lock alone, since the other Brave could really be running.
 
+**IntelliJ says "Start Failed" and that a process "is still running and does not respond".**
+Like Brave, IntelliJ notes its process ID in your settings folder and leaves it behind when it doesn't shut down cleanly. If that number belongs to another program the next time it starts, IntelliJ takes it for a stuck copy of itself. Started through `idea` or the app entry, session-setup removes those leftovers first, as long as no IntelliJ is running on the workstation.
+
 **Can I go back to the flatpak apps?**
 Yes. Their data is untouched, just open them from the app menu. Anything you did in the new apps since the copy won't be there.
 
@@ -249,6 +292,7 @@ A 1337 / 42 Linux workstation. Everything the script uses (bash, curl, unzip, ta
 ## Uninstall
 
 ```sh
+session-setup --remove idea   # only if you turned IntelliJ IDEA on
 rm ~/.local/bin/{session-setup,code,brave}
 rm ~/.local/share/applications/{code,brave}-native.desktop
 rm -r ~/.config/session-setup /goinfre/$USER/apps

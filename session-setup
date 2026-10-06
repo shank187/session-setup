@@ -4,20 +4,25 @@
 #
 # Installs the official Brave and VS Code builds in goinfre (the flatpak ones
 # can't use the GPU on these machines), copies your data over from the flatpak
-# apps once and opens them.
+# apps once and opens them. IntelliJ IDEA can be added the same way, on request.
 #
 # session-setup --help for the options, README.md for the details.
 
 set -euo pipefail
 
-VERSION=1.1.1
+VERSION=1.2.0
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # Inside a flatpak (e.g. the VS Code flatpak terminal): run on the host instead,
 # remembering which app we came from so we never close the terminal we run in.
 if [ -f /.flatpak-info ] && [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   if command -v host-spawn >/dev/null; then exec host-spawn "$SELF" --from-flatpak "${FLATPAK_ID:-}" "$@"; fi
-  exec flatpak-spawn --host "$SELF" --from-flatpak "${FLATPAK_ID:-}" "$@"
+  if flatpak-spawn --host true 2>/dev/null; then
+    exec flatpak-spawn --host "$SELF" --from-flatpak "${FLATPAK_ID:-}" "$@"
+  fi
+  echo "This terminal runs inside the ${FLATPAK_ID:-flatpak} sandbox, which can't reach the rest of the system." \
+       "Run session-setup from a regular terminal (Ctrl+Alt+T)." >&2
+  exit 1
 fi
 
 USER=${USER:-$(id -un)}
@@ -32,6 +37,13 @@ BRAVE_CACHE_BYTES=524288000   # 500 MB
 # Without its own window class the dock shows native Brave as the flatpak one.
 # VS Code ignores --class, but its "code" already differs from the flatpak's "Code".
 BRAVE_WM_CLASS=brave-native
+
+# IntelliJ IDEA is optional (--add idea). It's a single download: the free features
+# work as is, the paid ones need a license.
+IDEA_API="https://data.services.jetbrains.com/products/releases?code=IIU&latest=true&type=release"
+IDEA_FREE_MB=8000   # 1.6 GB download and 4.3 GB unpacked, both on disk for a moment
+OPTIONAL="$STATE_DIR/optional"
+IDEA_MARKER="$STATE_DIR/idea-import"
 
 # Default data folders of the native apps
 NEW_VSCODE="$CONF_DIR/Code"
@@ -59,10 +71,15 @@ usage: session-setup [options]
   --prepare                  only install/update and copy data
   --close-old                close the flatpak Brave and VS Code first (they can
                              keep running in the background after you close them)
-  --reimport [vscode|brave]  copy the flatpak data again; the current native data
+  --reimport [vscode|brave|idea]
+                             copy the flatpak data again; the current native data
                              is moved to <goinfre>/backups first
-  open vscode|brave [ARGS]   start the native app (what `code`, `brave` and the
-                             app grid entries run)
+  --add idea                 also set up IntelliJ IDEA (optional, about 4.3 GB in
+                             goinfre), with an `idea` command and an app entry
+  --remove idea              stop setting up IntelliJ IDEA (your settings are kept)
+  open vscode|brave|idea [ARGS]
+                             start the native app (what `code`, `brave`, `idea` and
+                             the app grid entries run)
   --version                  print the version
 EOF
 }
@@ -77,8 +94,9 @@ fi
 notify()    { notify-send "session-setup" "$*" 2>/dev/null || true; }
 json_get()  { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 pretty()    { echo "${1/#$HOME/\~}"; }
-label()     { case "$1" in vscode) echo "VS Code" ;; brave) echo "Brave" ;; *) echo "$1" ;; esac; }
-quit_hint() { case "$1" in vscode) echo "File > Exit" ;; brave) echo "Ctrl+Shift+Q" ;; esac; }
+label()     { case "$1" in vscode) echo "VS Code" ;; brave) echo "Brave" ;; idea) echo "IntelliJ IDEA" ;; *) echo "$1" ;; esac; }
+quit_hint() { case "$1" in vscode|idea) echo "File > Exit" ;; brave) echo "Ctrl+Shift+Q" ;; esac; }
+optional_on() { grep -qsx "$1" "$OPTIONAL"; }
 
 # --- finding things --------------------------------------------------------------
 
@@ -187,11 +205,11 @@ find_node_bin() {
 
 # --- installing the apps (goinfre) -----------------------------------------------
 
-# ensure_app NAME LATEST URL SHA256 SUBDIR
+# ensure_app NAME LATEST URL SHA256 SUBDIR [FREE_MB]
 # The old install is only replaced once the new one is downloaded and checked.
 # (set -e doesn't apply in functions called with ||, so every step is checked.)
 ensure_app() {
-  local name=$1 latest=$2 url=$3 sha=$4 subdir=$5 dest="$APPS/$1" have tmp
+  local name=$1 latest=$2 url=$3 sha=$4 subdir=$5 need=${6:-0} dest="$APPS/$1" have tmp free
   have=$(cat "$dest/.installed-version" 2>/dev/null || true)
   if [ -z "$latest" ]; then
     if [ -n "$have" ]; then warn "$(label "$name"): no answer from the update server, keeping $have"; return 0; fi
@@ -202,6 +220,10 @@ ensure_app() {
     warn "$(label "$name") $latest is out, close it and run again to update (keeping $have for now)"; return 0
   fi
 
+  free=$(df -Pm "$GOINFRE" | awk 'NR == 2 {print $4}')
+  if [ "${free:-0}" -lt "$need" ]; then
+    warn "$(label "$name") needs about $((need / 1000)) GB free in $GOINFRE, there's $((free / 1000)) GB"; return 1
+  fi
   log "Downloading $(label "$name") $latest to $dest"
   tmp=$(mktemp -d "$GOINFRE/.download.XXXXXX")
   if ! { curl -fL --progress-bar -o "$tmp/archive" "$url" &&
@@ -238,6 +260,20 @@ install_brave() {
     latest=""
   fi
   ensure_app brave "$latest" "$url" "$sha" ""
+}
+
+install_idea() {
+  local meta latest="" build="" url="" sum="" sha=""
+  if meta=$(curl -fsSL --max-time 15 "$IDEA_API") &&
+     read -r latest build url sum < <(python3 -c '
+import json, sys
+r = json.load(sys.stdin)["IIU"][0]; l = r["downloads"]["linux"]
+print(r["version"], r["build"], l["link"], l["checksumLink"])' <<<"$meta" 2>/dev/null); then
+    sha=$(curl -fsSL --max-time 15 "$sum" | cut -d' ' -f1) || latest=""
+  else
+    latest=""
+  fi
+  ensure_app idea "$latest" "$url" "$sha" "idea-IU-$build" "$IDEA_FREE_MB"
 }
 
 # --- copying data from the flatpak apps (home) -----------------------------------
@@ -289,9 +325,9 @@ carry_tool_configs() {
     for item in "$root/$kind"/*; do
       [ -e "$item" ] || continue
       name=$(basename "$item")
-      case "$name" in   # the apps' own data, nvm (used where it is) and desktop stuff
-        BraveSoftware|Code|vscode|nvm|dconf|glib-2.0|gtk-*|ibus|pulse|fontconfig|user-dirs.*|\
-        recently-used.xbel|flatpak*|mimeapps.list|QtProject.conf|kdeglobals) continue ;;
+      case "$name" in   # the apps' own data, nvm (used where it is), desktop and sandbox stuff
+        BraveSoftware|Code|vscode|JetBrains|nvm|dconf|glib-2.0|gtk-*|ibus|pulse|fontconfig|user-dirs.*|\
+        recently-used.xbel|flatpak*|mimeapps.list|QtProject.conf|kdeglobals|keyrings|npmrc) continue ;;
       esac
       [ -e "$dest/$name" ] && continue
       mkdir -p "$dest" && cp -a "$item" "$dest/" && log "Copied $kind/$name from $(pretty "$root") to $(pretty "$dest")/"
@@ -299,8 +335,68 @@ carry_tool_configs() {
   done
 }
 
+# IntelliJ imports the settings of an earlier version by itself on its first start
+# when it finds them in ~/.config/JetBrains (that's how it upgrades). So the flatpak
+# settings and plugins are copied there under their own name, IntelliJ does the rest.
+import_idea() {
+  local old=$OLD_IDEA name conf plug oldplug root bak d
+  [ -n "$old" ] || return 0
+  name=$(basename "$old") root=$(app_root "$old")
+  conf="$CONF_DIR/JetBrains/$name" plug="$DATA_DIR/JetBrains/$name"
+  oldplug="$root/data/JetBrains/$name"                                 # flatpak
+  [ -d "$oldplug" ] || oldplug="$root/.local/share/JetBrains/$name"   # snap
+  if [[ " $REIMPORT " != *" idea "* ]]; then
+    [ -f "$IDEA_MARKER" ] && return 0
+    if compgen -G "$CONF_DIR/JetBrains/IntelliJIdea*/options" >/dev/null; then
+      printf 'kept=existing\ndate=%s\n' "$(date -Is)" > "$IDEA_MARKER"
+      log "Keeping the IntelliJ IDEA settings you already had (--reimport idea to use the flatpak ones)"
+      return 0
+    fi
+  fi
+  if old_app_running "$old" && ! offer_close_old idea "$old"; then
+    warn "The flatpak IntelliJ IDEA is still running. Quit it (File > Exit) or run: session-setup --close-old"
+    return 1
+  fi
+  if pgrep -f "$APPS/idea/" >/dev/null; then warn "Close the native IntelliJ IDEA and run again"; return 1; fi
+  # the native settings (if any) go to backups so IntelliJ imports the flatpak ones again
+  for d in "$CONF_DIR"/JetBrains/IntelliJIdea* "$conf" "$plug"; do
+    [ -e "$d" ] || continue
+    bak="$GOINFRE/backups/JetBrains-$(basename "$d")-$(date +%Y%m%d-%H%M%S)"
+    { mkdir -p "$GOINFRE/backups" && mv "$d" "$bak"; } || { warn "Couldn't move $d out of the way"; return 1; }
+    log "Moved the previous $(pretty "$d") to $bak"
+  done
+  log "Copying your IntelliJ IDEA settings from $(pretty "$old")"
+  mkdir -p "$(dirname "$conf")" "$(dirname "$plug")"
+  if ! { rsync -a "${CACHE_EXCLUDES[@]}" "$old/" "$conf.partial/" && mv "$conf.partial" "$conf" &&
+         { [ ! -d "$oldplug" ] || { rsync -a "$oldplug/" "$plug.partial/" && mv "$plug.partial" "$plug"; }; } &&
+         printf 'from=%s\ndate=%s\n' "$old" "$(date -Is)" > "$IDEA_MARKER"; }; then
+    warn "Copying the IntelliJ IDEA settings failed"; return 1
+  fi
+  [ -z "$root" ] || carry_tool_configs "$root"
+}
+
 vscode_ready() { [ -x "$APPS/vscode/bin/code" ] && { [ -z "$OLD_VSCODE" ] || [ -f "$NEW_VSCODE/$MARKER" ]; }; }
 brave_ready()  { [ -x "$APPS/brave/brave" ]     && { [ -z "$OLD_BRAVE" ]  || [ -f "$NEW_BRAVE/$MARKER" ]; }; }
+idea_ready()   { [ -x "$APPS/idea/bin/idea" ]   && { [ -z "$OLD_IDEA" ]   || [ -f "$IDEA_MARKER" ]; }; }
+
+# IntelliJ's caches and indexes grow to gigabytes and are rebuilt when missing: goinfre
+idea_properties() {
+  local dir sys
+  dir=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["dataDirectoryName"])' \
+        "$APPS/idea/product-info.json") || return 0
+  sys="$GOINFRE/cache/JetBrains/$dir"
+  printf 'idea.system.path=%s\nidea.log.path=%s\n' "$sys" "$sys/log" > "$STATE_DIR/idea.properties"
+  export IDEA_PROPERTIES="$STATE_DIR/idea.properties"
+  # IntelliJ notes its process ID in .lock (settings, home) and .pid/.port (caches) and
+  # leaves them behind when it doesn't shut down cleanly, like logging out with it open.
+  # If the ID belongs to a process it can't inspect by the next start (root's, on another
+  # post), it takes it for a stuck copy of itself and refuses to start. With no IntelliJ
+  # running on this post, those files can only be leftovers.
+  if ! pgrep -f '/bin/idea( |$)|com\.intellij\.idea\.Main' >/dev/null; then
+    rm -f "$sys/.port" "$sys/.pid"
+    if ! home_is_shared "$CONF_DIR"; then rm -f "$CONF_DIR/JetBrains/$dir/.lock"; fi
+  fi
+}
 
 # downloaded .vsix files are only a cache, keep them off the home quota
 link_vsix_cache() {
@@ -368,6 +464,19 @@ Categories=Network;WebBrowser;
 MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
 StartupWMClass=$BRAVE_WM_CLASS
 EOF
+  if optional_on idea; then
+    write_wrapper idea idea
+    cat > "$DATA_DIR/applications/idea-native.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=IntelliJ IDEA (native)
+Comment=IntelliJ IDEA from goinfre, outside the flatpak sandbox
+Exec=$exec open idea %F
+Icon=$APPS/idea/bin/idea.svg
+Categories=Development;IDE;Java;
+StartupWMClass=jetbrains-idea
+EOF
+  fi
 
   case "$(basename "${SHELL:-}")" in
     zsh)  rc="$HOME/.zshrc" ;;
@@ -414,6 +523,31 @@ prepare() {
   return $failed
 }
 
+# only once it's turned on, and after the other two are open: it's a big download
+prepare_idea() {
+  optional_on idea || return 0
+  install_idea && import_idea
+}
+
+add_idea() {
+  if ! optional_on idea; then
+    mkdir -p "$STATE_DIR" && echo idea >> "$OPTIONAL"
+    log "IntelliJ IDEA turned on: it's set up from now on, on every post (session-setup --remove idea to stop)"
+  fi
+}
+
+remove_idea() {
+  local f
+  if pgrep -f "$APPS/idea/" >/dev/null; then warn "Close IntelliJ IDEA first"; return 1; fi
+  if [ -f "$OPTIONAL" ]; then grep -vx idea "$OPTIONAL" > "$OPTIONAL.new" || true; mv "$OPTIONAL.new" "$OPTIONAL"; fi
+  f="$INSTALL_DIR/idea"
+  if grep -qs 'session-setup' "$f"; then rm -f "$f"; fi
+  rm -f "$DATA_DIR/applications/idea-native.desktop"
+  rm -rf "$APPS/idea"
+  log "IntelliJ IDEA turned off and removed from this post's goinfre." \
+      "Your settings stay in $(pretty "$CONF_DIR/JetBrains")"
+}
+
 free_ram() {
   # the software center's background updater, ~300 MB; GNOME starts it again at next login
   if pkill -f 'gnome-software --gapplication-service'; then
@@ -439,6 +573,13 @@ launch_apps() {
   done
 }
 
+# A lock another post left in the home folder is stale: the home is only mounted on one
+# post at a time. Not so on a network filesystem several posts can use at once.
+home_is_shared() {
+  case "$(stat -f -c %T "$1" 2>/dev/null)" in nfs*|cifs|smb*|afs|ceph|fuse*) return 0 ;; esac
+  return 1
+}
+
 # Brave locks its profile with a SingletonLock link to "<host>-<pid>". Leave a post
 # with Brave still open and the lock stays in your home; Brave on the next post then
 # refuses to start, as it can't check a process on another computer. A home that is
@@ -448,9 +589,7 @@ clear_stale_brave_lock() {
   owner=$(readlink "$NEW_BRAVE/SingletonLock" 2>/dev/null) || return 0
   host=${owner%-*}
   [ "$host" != "$(uname -n)" ] || return 0   # Brave sorts out locks from this post itself
-  case "$(stat -f -c %T "$NEW_BRAVE" 2>/dev/null)" in
-    nfs*|cifs|smb*|afs|ceph|fuse*) return 0 ;;   # home shared between posts, could be live
-  esac
+  if home_is_shared "$NEW_BRAVE"; then return 0; fi
   rm -f "$NEW_BRAVE/SingletonLock" "$NEW_BRAVE/SingletonCookie" "$NEW_BRAVE/SingletonSocket"
   log "Unlocked the Brave profile (left locked by $host)"
 }
@@ -459,11 +598,18 @@ clear_stale_brave_lock() {
 # doesn't have the app yet, then start it
 open_app() {
   local name=$1; shift
+  if [ "$name" = idea ] && ! optional_on idea; then
+    echo "IntelliJ IDEA is optional, turn it on with: session-setup --add idea" >&2
+    notify "IntelliJ IDEA is optional, turn it on with: session-setup --add idea"; exit 1
+  fi
   if ! "${name}_ready"; then
-    notify "Getting $(label "$name") ready on this post, takes about a minute..."
+    if [ "$name" = idea ]; then notify "Getting IntelliJ IDEA ready on this post, takes a few minutes..."
+    else notify "Getting $(label "$name") ready on this post, takes about a minute..."; fi
     # wait for a run that may already be setting things up, then check again
     flock -w 600 9 || { notify "session-setup is busy, try again in a minute"; exit 1; }
-    "${name}_ready" || prepare >"$STATE_DIR/last-run.log" 2>&1 || true
+    if ! "${name}_ready"; then
+      { prepare; if [ "$name" = idea ]; then prepare_idea; fi; } >"$STATE_DIR/last-run.log" 2>&1 || true
+    fi
     if ! "${name}_ready"; then
       notify "$(label "$name") isn't ready: $(grep -h '^!!' "$STATE_DIR/last-run.log" | tail -n1 | cut -c5-)"
       exit 1
@@ -478,11 +624,14 @@ open_app() {
     brave)
       clear_stale_brave_lock
       exec "$APPS/brave/brave" --class="$BRAVE_WM_CLASS" --disk-cache-size="$BRAVE_CACHE_BYTES" "$@" ;;
+    idea)
+      idea_properties
+      exec "$APPS/idea/bin/idea" "$@" ;;
   esac
 }
 
 main() {
-  MODE=full REIMPORT="" CLOSE_OLD=0 FROM_FLATPAK=""
+  MODE=full REIMPORT="" CLOSE_OLD=0 FROM_FLATPAK="" ADD="" REMOVE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --prepare)      MODE=prepare ;;
@@ -490,15 +639,22 @@ main() {
       --from-flatpak) FROM_FLATPAK=${2:-}; shift ;;
       --reimport)
         case "${2:-}" in
-          vscode|code) REIMPORT=vscode; shift ;;
-          brave)       REIMPORT=brave; shift ;;
-          *)           REIMPORT="vscode brave" ;;
+          vscode|code)   REIMPORT=vscode; shift ;;
+          brave)         REIMPORT=brave; shift ;;
+          idea|intellij) REIMPORT=idea; shift ;;
+          *)             REIMPORT="vscode brave idea" ;;
+        esac ;;
+      --add|--remove)
+        case "${2:-}" in
+          idea|intellij) if [ "$1" = --add ]; then ADD=idea; else REMOVE=idea; fi; shift ;;
+          *) echo "usage: session-setup $1 idea" >&2; exit 2 ;;
         esac ;;
       open)
         case "${2:-}" in
-          vscode|code) OPEN_APP=vscode ;;
-          brave)       OPEN_APP=brave ;;
-          *) echo "usage: session-setup open vscode|brave [ARGS]" >&2; exit 2 ;;
+          vscode|code)   OPEN_APP=vscode ;;
+          brave)         OPEN_APP=brave ;;
+          idea|intellij) OPEN_APP=idea ;;
+          *) echo "usage: session-setup open vscode|brave|idea [ARGS]" >&2; exit 2 ;;
         esac
         MODE=open; shift 2; break ;;
       -h|--help) usage; exit 0 ;;
@@ -513,6 +669,9 @@ main() {
   OLD_VSCODE=$(newest "$HOME"/.var/app/*/config/Code "$HOME"/snap/code/current/.config/Code)
   OLD_BRAVE=$(newest "$HOME"/.var/app/*/config/BraveSoftware/Brave-Browser \
                      "$HOME"/snap/brave/current/.config/BraveSoftware/Brave-Browser)
+  OLD_IDEA=$(newest "$HOME"/.var/app/com.jetbrains.IntelliJ-IDEA-*/config/JetBrains/IdeaIC* \
+                    "$HOME"/.var/app/com.jetbrains.IntelliJ-IDEA-*/config/JetBrains/IntelliJIdea* \
+                    "$HOME"/snap/intellij-idea-*/current/.config/JetBrains/I*)
   VSCODE_EXTENSIONS=$(find_vscode_extensions)
   if ! mkdir -p "$APPS" 2>/dev/null; then
     echo "Can't write to $GOINFRE. Set GOINFRE to a folder you own, e.g. GOINFRE=/goinfre/$USER session-setup" >&2
@@ -525,20 +684,30 @@ main() {
   exec 9>"$STATE_DIR/lock"
   if [ "$MODE" = open ]; then open_app "$OPEN_APP" "$@"; fi
   if ! flock -n 9; then echo "session-setup is already running" >&2; exit 1; fi
+  if [ -n "$REMOVE" ]; then remove_idea; exit; fi
+  if [ -n "$ADD" ]; then add_idea; fi
 
   log "goinfre:            $GOINFRE"
   log "flatpak VS Code:    $(pretty "${OLD_VSCODE:-not found}")"
   log "VS Code extensions: $(pretty "$VSCODE_EXTENSIONS")"
   log "flatpak Brave:      $(pretty "${OLD_BRAVE:-not found}")"
+  if optional_on idea; then log "flatpak IntelliJ:   $(pretty "${OLD_IDEA:-not found}")"; fi
 
   if [ "$CLOSE_OLD" = 1 ]; then
     [ -z "$OLD_VSCODE" ] || close_old_app vscode "$OLD_VSCODE" || FAILED=1
     [ -z "$OLD_BRAVE" ]  || close_old_app brave "$OLD_BRAVE" || FAILED=1
+    if optional_on idea && [ -n "$OLD_IDEA" ]; then close_old_app idea "$OLD_IDEA" || FAILED=1; fi
   fi
+  rm -rf "$GOINFRE"/.download.*   # left by a run that was interrupted (we hold the lock)
   prepare || FAILED=1
   if [ "$MODE" = full ]; then
     free_ram
     launch_apps
+  fi
+  prepare_idea || FAILED=1
+  if [ -n "$OLD_IDEA" ] && ! optional_on idea && [ ! -e "$STATE_DIR/idea-hint" ]; then
+    log "You also have the flatpak IntelliJ IDEA. To set up a native one too: session-setup --add idea"
+    touch "$STATE_DIR/idea-hint"
   fi
   if [ "$FAILED" = 0 ]; then log "Done."; else warn "Done, but with warnings (see above)"; exit 1; fi
 }
